@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets and credentials
+.env
+*.env
+credentials.json
+token.json
+*_credentials.json
+secrets.yaml
+
+# Logs
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite
+
+# Model weights (too large for git)
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Audio/Video files (can be large)
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mkv
+
+# ChromaDB data
+chroma_data/
+chroma_db/
+*_chroma/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Backup files
+jarvis_dashboard_backup.py
+
+# Config with API keys - DO NOT COMMIT
+cloud_config.py
+
+# Conversation history (privacy)
+conversations/
+memory/
+
+# Gradio certificate
+.gradio/
+
+# Claude settings (local)
+.claude/
+
+# RAG databases
+rag_data/
+rag_db/
+
+# Unsloth cache
+unsloth_compiled_cache/
