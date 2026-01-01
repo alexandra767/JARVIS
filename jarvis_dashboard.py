@@ -815,51 +815,88 @@ def load_flux_pipeline():
 
 def generate_image(
     prompt: str,
-    use_trigger: bool = True,
+    negative_prompt: str = "",
+    model_choice: str = "Juggernaut (Nature/Action)",
+    use_trigger: bool = False,
     width: int = 768,
     height: int = 1024,
-    steps: int = 4,
+    steps: int = 25,
     seed: int = -1,
+    guidance: float = 8.0,
     progress=gr.Progress()
 ) -> tuple:
-    """Generate image using FLUX + LoRA"""
-    import torch
+    """Generate image using Juggernaut XL or Pony Realism via standalone generator"""
+    from gradio_client import Client
 
-    progress(0.1, desc="Loading model...")
-
-    pipe = load_flux_pipeline()
-    if pipe is None:
-        return None, "Failed to load FLUX model"
-
-    # Add trigger word if enabled
-    if use_trigger and CONFIG["trigger_word"] not in prompt.lower():
-        prompt = f"{CONFIG['trigger_word']}, {prompt}"
-
-    progress(0.3, desc="Generating image...")
+    progress(0.1, desc="Connecting to image generator...")
 
     try:
-        # Set seed
-        if seed == -1:
-            seed = int(time.time()) % 2147483647
-        generator = torch.Generator("cuda").manual_seed(seed)
+        # Connect to the standalone image generator
+        client = Client("http://localhost:7865", verbose=False)
 
-        # Generate
-        image = pipe(
-            prompt,
-            num_inference_steps=steps,
-            guidance_scale=0.0,
-            generator=generator,
-            height=height,
+        progress(0.3, desc="Generating image...")
+
+        logger.info(f"[IMAGE] Generating via API: {prompt[:80]}... Model: {model_choice}")
+
+        # Default negative prompt if empty
+        if not negative_prompt:
+            negative_prompt = "blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text"
+
+        # Call the generate function
+        result = client.predict(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            model_choice=model_choice,
+            use_trigger=use_trigger,
             width=width,
-        ).images[0]
+            height=height,
+            steps=steps,
+            guidance=guidance,
+            seed=seed,
+            api_name="/generate"
+        )
 
         progress(1.0, desc="Done!")
 
-        return image, f"Generated with seed: {seed}"
+        # Result is (image_path, info_string)
+        if result and len(result) >= 2:
+            from PIL import Image
+            image = Image.open(result[0])
+            return image, result[1]
+        else:
+            return None, "No image returned"
 
     except Exception as e:
         logger.error(f"Image generation error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None, f"Error: {str(e)}"
+
+
+def unload_image_models():
+    """Unload image models to free VRAM"""
+    from gradio_client import Client
+    try:
+        client = Client("http://localhost:7865", verbose=False)
+        result = client.predict(api_name="/unload_models")
+        logger.info(f"[IMAGE] Models unloaded: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error unloading models: {e}")
+        return f"Error: {str(e)}"
+
+
+def load_image_models():
+    """Load image models back into VRAM"""
+    from gradio_client import Client
+    try:
+        client = Client("http://localhost:7865", verbose=False)
+        result = client.predict(api_name="/load_models")
+        logger.info(f"[IMAGE] Models loaded: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error loading models: {e}")
+        return f"Error: {str(e)}"
 
 
 # ============================================================================
@@ -4741,7 +4778,7 @@ def create_dashboard():
                             border-radius: 10px; margin-bottom: 15px;">
                     <h2 style="margin: 0; color: white;">✨ JARVIS Image Generator</h2>
                     <p style="color: rgba(255,255,255,0.7); margin: 5px 0 0 0;">
-                        Using FLUX + Your Trained LoRA
+                        Juggernaut XL + Pony Realism with Alexandra LoRA
                     </p>
                 </div>
                 """)
@@ -4754,9 +4791,21 @@ def create_dashboard():
                             lines=3,
                         )
 
+                        img_negative = gr.Textbox(
+                            label="Negative Prompt (what to avoid)",
+                            value="blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text, censored, merged bodies, fused limbs, conjoined, overlapping bodies, worst quality",
+                            lines=2,
+                        )
+
+                        model_select = gr.Radio(
+                            choices=["Juggernaut (Nature/Action)", "Pony Realism (People/Explicit)"],
+                            value="Juggernaut (Nature/Action)",
+                            label="Select Model"
+                        )
+
                         use_trigger = gr.Checkbox(
                             label=f"Add trigger word: '{CONFIG['trigger_word']}'",
-                            value=True,
+                            value=False,
                         )
 
                         with gr.Row():
@@ -4764,10 +4813,17 @@ def create_dashboard():
                             img_height = gr.Slider(512, 1536, value=1024, step=64, label="Height")
 
                         with gr.Row():
-                            img_steps = gr.Slider(1, 20, value=4, step=1, label="Steps")
+                            img_steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
                             img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                            img_guidance = gr.Slider(5, 12, value=8.0, step=0.5, label="Guidance")
 
                         generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
+
+                        with gr.Row():
+                            unload_img_btn = gr.Button("🗑️ Unload Image Models", variant="secondary")
+                            load_img_btn = gr.Button("📥 Load Image Models", variant="secondary")
+
+                        img_status = gr.Textbox(label="Model Status", value="Models ready", interactive=False)
 
                         # Preset prompts
                         gr.HTML("<h4 style='color: white; margin-top: 20px;'>Quick Presets:</h4>")
@@ -5813,8 +5869,18 @@ def create_dashboard():
         # Image generation handler
         generate_btn.click(
             generate_image,
-            inputs=[img_prompt, use_trigger, img_width, img_height, img_steps, img_seed],
+            inputs=[img_prompt, img_negative, model_select, use_trigger, img_width, img_height, img_steps, img_seed, img_guidance],
             outputs=[output_image, output_info]
+        )
+
+        unload_img_btn.click(
+            unload_image_models,
+            outputs=[img_status]
+        )
+
+        load_img_btn.click(
+            load_image_models,
+            outputs=[img_status]
         )
 
         # Capture from server camera handler
