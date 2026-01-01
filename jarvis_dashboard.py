@@ -1855,17 +1855,15 @@ Current date: {date_str}{memory_context}{rag_context}"""
                 for i, r in enumerate(web_search_results[:5], 1):
                     title = r.get('title', 'Unknown')
                     body = r.get('body', r.get('snippet', ''))[:600]
-                    search_context += f"Article {i}: {title}\nSummary: {body}\n\n"
+                    search_context += f"[Source {i}] {title}: {body}\n\n"
                 search_context += """
-CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE EXACTLY:
-1. ANSWER DIRECTLY AND CONCISELY - Just give the answer the user asked for. Don't list articles or sources.
-2. For simple questions (scores, schedules, times), give a SHORT one-sentence answer.
-3. DO NOT list "Article 1:", "Article 2:", etc. - just extract the answer and state it naturally.
-4. DO NOT say "according to search results" or "I found these articles" - just answer the question.
-5. DO NOT invent, fabricate, or make up any information not in the search results.
-6. If the search results don't contain the answer, say "I couldn't find that specific information, shall I search again?"
-7. Only provide detailed breakdowns if the user specifically asks for more information.
-8. Be conversational and natural - you're a butler, not a search engine."""
+CRITICAL - HOW TO RESPOND:
+- Extract the answer from the sources above and state it DIRECTLY in ONE sentence.
+- NEVER mention "Article 1", "Article 2", sources, or where you found the info.
+- NEVER list multiple articles or say "according to my search".
+- Just answer like a knowledgeable butler: "The Steelers play the Ravens this Sunday, ma'am."
+- If the answer isn't clear, say "I couldn't find that specific information, shall I search again?"
+- Be brief and natural. You already know the answer - just say it."""
                 llm_message = message + search_context
                 logger.info("[LLM] Including web search results in prompt for summarization")
 
