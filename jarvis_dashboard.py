@@ -1821,14 +1821,14 @@ Current date: {date_str}{memory_context}{rag_context}"""
                     search_context += f"Article {i}: {title}\nSummary: {body}\n\n"
                 search_context += """
 CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE EXACTLY:
-1. When presenting headlines, ONLY list the exact titles shown above (Article 1, Article 2, etc.)
-2. If the user asks about CBS/CNN/etc news, ONLY mention articles that are actually from that source
-3. If you don't have articles from the requested source, say "I didn't find specific articles from [source], but here's what I found:"
-4. DO NOT invent, fabricate, or make up any headlines, article titles, or article content
-5. DO NOT use your training data - it's outdated. Only use the search results above.
-6. When asked to summarize an article, use ONLY the information provided above
-7. If asked for "article 2" or "number 2", refer to "Article 2" from the list above
-8. Be honest if the search results are limited - offer to search again with different terms"""
+1. ANSWER DIRECTLY AND CONCISELY - Just give the answer the user asked for. Don't list articles or sources.
+2. For simple questions (scores, schedules, times), give a SHORT one-sentence answer.
+3. DO NOT list "Article 1:", "Article 2:", etc. - just extract the answer and state it naturally.
+4. DO NOT say "according to search results" or "I found these articles" - just answer the question.
+5. DO NOT invent, fabricate, or make up any information not in the search results.
+6. If the search results don't contain the answer, say "I couldn't find that specific information, shall I search again?"
+7. Only provide detailed breakdowns if the user specifically asks for more information.
+8. Be conversational and natural - you're a butler, not a search engine."""
                 llm_message = message + search_context
                 logger.info("[LLM] Including web search results in prompt for summarization")
 
@@ -3687,21 +3687,35 @@ def create_dashboard():
                 if (!isFinal) return;
                 window.lastConvResult = true; // Mark that we got a result
 
-                // Check for exit phrases
-                const exitPhrases = ['goodbye', 'good bye', 'stop listening', 'that\\'s all', 'thats all', 'never mind', 'cancel', 'stop'];
-                if (exitPhrases.some(p => transcript.toLowerCase().includes(p))) {
+                // Check for exit phrases - stop conversation mode and wait for wake word
+                const exitPhrases = ['goodbye', 'good bye', 'stop listening', 'stop conversation',
+                    'that\\'s all', 'thats all', 'that is all', 'never mind', 'nevermind',
+                    'go to sleep', 'sleep mode', 'standby', 'stand by', 'dismiss', 'dismissed'];
+                const lowerText = transcript.toLowerCase();
+                if (exitPhrases.some(p => lowerText.includes(p))) {
                     window.conversationMode = false;
                     if (window.setOrbState) window.setOrbState(null);
                     const indicator = document.getElementById('conv-mode-indicator');
                     if (indicator) indicator.style.display = 'none';
+
+                    // Stop any ongoing audio
+                    if (window.stopAllAudio) window.stopAllAudio();
+
+                    // Visual feedback - brief flash
+                    const orb = document.getElementById('jarvis-orb-svg');
+                    if (orb) {
+                        orb.style.filter = 'hue-rotate(120deg)'; // Green flash
+                        setTimeout(() => { orb.style.filter = ''; }, 500);
+                    }
+
                     // Resume wake word recognition
                     if (window.wakeWordRecognition) {
                         try {
                             window.wakeWordRecognition.start();
-                            console.log('[JARVIS] Wake word recognition resumed');
+                            console.log('[JARVIS] Wake word recognition resumed - standing by');
                         } catch(e) {}
                     }
-                    console.log('[JARVIS] Conversation ended');
+                    console.log('[JARVIS] Conversation ended - awaiting wake word');
                     return;
                 }
 
