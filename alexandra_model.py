@@ -356,3 +356,35 @@ def get_available_models():
     """Get list of available models"""
     return list(AVAILABLE_MODELS.keys())
 
+
+def unload_model():
+    """Unload current model to free GPU memory"""
+    global model, tokenizer, processor, current_model_name, current_model_type
+
+    if model is None:
+        return "No model loaded"
+
+    model_name = current_model_name
+    try:
+        del model
+        if tokenizer is not None:
+            del tokenizer
+        if processor is not None:
+            del processor
+        torch.cuda.empty_cache()
+
+        model = None
+        tokenizer = None
+        processor = None
+        current_model_name = None
+        current_model_type = None
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        mem = torch.cuda.memory_allocated() / 1024**3
+        return f"Unloaded {model_name} - GPU Memory freed: {mem:.1f}GB remaining"
+    except Exception as e:
+        return f"Error unloading model: {e}"
+

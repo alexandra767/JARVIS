@@ -6,7 +6,7 @@ Combines real-time widgets, voice interaction, camera, and image generation
 
 # Import local model loading
 try:
-    from alexandra_model import load_model, unload_model, generate_response as model_generate, get_model_status, AVAILABLE_MODELS, DEFAULT_MODEL
+    from alexandra_model import load_model, generate_response as model_generate, get_model_status, AVAILABLE_MODELS, DEFAULT_MODEL
     LOCAL_MODEL_AVAILABLE = True
 except ImportError as e:
     print(f"Local model not available: {e}")
@@ -24,8 +24,7 @@ except ImportError as e:
 try:
     from alexandra_vision import (
         load_vision_model, unload_vision_model, analyze_image as vision_analyze,
-        get_vision_status, VISION_AVAILABLE as QWEN_VISION_AVAILABLE
-    )
+        get_vision_status, VISION_AVAILABLE as QWEN_VISION_AVAILABLE)
     QWEN_VISION_READY = True
 except ImportError as e:
     print(f"Qwen2-VL vision module not available: {e}")
@@ -38,7 +37,6 @@ import queue
 import time
 import os
 import sys
-import random
 import numpy as np
 import cv2
 from datetime import datetime
@@ -382,7 +380,7 @@ CONFIG = {
     "ollama_url": "http://localhost:11434",
     "llm_model": "qwen3-coder:30b",
     "flux_model": "black-forest-labs/FLUX.1-schnell",
-    "lora_path": "/workspace/loras/flux_dreambooth.safetensors",
+    "lora_path": "/workspace/models/alexandra-lora",
     "lora_path_uncensored": "/workspace/loras/flux-uncensored.safetensors",
     "trigger_word": "alexandra woman",
     "default_location": "Ridgway, PA",
@@ -685,6 +683,10 @@ async def get_news_widget(topic: str = None) -> str:
     try:
         headlines = await state.tools.news.get_headlines(topic)
 
+        # Store headlines so chat can reference them when user asks about "the npr article" etc.
+        if headlines and "error" not in headlines[0]:
+            state.news_data = headlines[:5]
+
         if not headlines or "error" in headlines[0]:
             return """
             <div style="background: linear-gradient(135deg, #232526 0%, #414345 100%);
@@ -780,73 +782,98 @@ def generate_waveform_image(audio_data: np.ndarray = None, is_speaking: bool = F
 
 
 # ============================================================================
-# IMAGE GENERATION (FLUX)
+# IMAGE GENERATION (PONY DIFFUSION / SDXL)
 # ============================================================================
 
 def load_flux_pipeline():
-    """Load FLUX pipeline for image generation"""
+    """Load Juggernaut XL V9 pipeline with Alexandra LoRA for image generation"""
     global state
 
+    print("[IMAGE] load_flux_pipeline called", flush=True)
+
     if state.flux_pipeline is not None:
+        print("[IMAGE] Returning cached pipeline", flush=True)
         return state.flux_pipeline
 
     try:
         import torch
-        from diffusers import FluxPipeline
+        import os
+        from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler
+        from peft import PeftModel
 
-        logger.info("Loading FLUX pipeline...")
-        pipe = FluxPipeline.from_pretrained(
-            CONFIG["flux_model"],
-            torch_dtype=torch.bfloat16
+        model_path = "/workspace/models/juggernaut-xl-v9"
+        lora_path = "/workspace/models/alexandra-lora"
+
+        print(f"[IMAGE] Loading Juggernaut XL V9 from {model_path}...", flush=True)
+
+        # Load pipeline and move to GPU
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant="fp16"
         ).to("cuda")
 
-        # Load LoRA
-        if os.path.exists(CONFIG["lora_path"]):
-            logger.info(f"Loading LoRA from {CONFIG['lora_path']}")
-            pipe.load_lora_weights(CONFIG["lora_path"])
+        print("[IMAGE] Base model on GPU, loading LoRA...", flush=True)
+
+        # Load Alexandra LoRA using PEFT if available
+        if os.path.exists(lora_path):
+            try:
+                pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_path)
+                pipe.unet = pipe.unet.merge_and_unload()
+                print("[IMAGE] LoRA merged!", flush=True)
+            except Exception as e:
+                print(f"[IMAGE] LoRA failed (using base model): {e}", flush=True)
+
+        # Use DPM++ 2M Karras scheduler for better quality
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe.scheduler.config,
+            use_karras_sigmas=True,
+            algorithm_type="dpmsolver++"
+        )
+
+        # Enable memory optimizations
+        pipe.enable_attention_slicing()
 
         state.flux_pipeline = pipe
-        logger.info("FLUX pipeline loaded")
+        print("[IMAGE] Juggernaut XL V9 pipeline loaded and cached!", flush=True)
         return pipe
 
     except Exception as e:
-        logger.error(f"Failed to load FLUX: {e}")
+        print(f"[IMAGE] FAILED to load: {e}", flush=True)
+        import traceback
+        print(traceback.format_exc(), flush=True)
         return None
 
 
 def generate_image(
     prompt: str,
-    negative_prompt: str = "",
-    model_choice: str = "Juggernaut (Nature/Action)",
-    use_trigger: bool = False,
-    width: int = 768,
-    height: int = 1024,
-    steps: int = 25,
-    seed: int = -1,
-    guidance: float = 8.0,
+    negative_prompt: str,
+    model_choice: str,
+    use_trigger: bool,
+    width: int,
+    height: int,
+    steps: int,
+    guidance: float,
+    seed: int,
     progress=gr.Progress()
 ) -> tuple:
-    """Generate image using Juggernaut XL or Pony Realism via standalone generator"""
     from gradio_client import Client
-
+    
     progress(0.1, desc="Connecting to image generator...")
-
+    
     try:
-        # Connect to the standalone image generator
+        # Connect to the standalone image generator (already has model loaded)
         client = Client("http://localhost:7865", verbose=False)
-
+        
         progress(0.3, desc="Generating image...")
-
-        logger.info(f"[IMAGE] Generating via API: {prompt[:80]}... Model: {model_choice}")
-
-        # Default negative prompt if empty
-        if not negative_prompt:
-            negative_prompt = "blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text"
-
+        
+        logger.info(f"[IMAGE] Generating via API: {prompt[:80]}...")
+        
         # Call the generate function
         result = client.predict(
             prompt=prompt,
-            negative_prompt=negative_prompt,
+            negative_prompt=negative_prompt if negative_prompt else "blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text",
             model_choice=model_choice,
             use_trigger=use_trigger,
             width=width,
@@ -856,9 +883,9 @@ def generate_image(
             seed=seed,
             api_name="/generate"
         )
-
+        
         progress(1.0, desc="Done!")
-
+        
         # Result is (image_path, info_string)
         if result and len(result) >= 2:
             from PIL import Image
@@ -866,7 +893,7 @@ def generate_image(
             return image, result[1]
         else:
             return None, "No image returned"
-
+            
     except Exception as e:
         logger.error(f"Image generation error: {e}")
         import traceback
@@ -874,6 +901,7 @@ def generate_image(
         return None, f"Error: {str(e)}"
 
 
+# ============================================================================
 def unload_image_models():
     """Unload image models to free VRAM"""
     from gradio_client import Client
@@ -900,81 +928,6 @@ def load_image_models():
         return f"Error: {str(e)}"
 
 
-def generate_img2img(
-    input_image,
-    prompt: str,
-    negative_prompt: str = "",
-    model_choice: str = "Pony Realism (Explicit)",
-    strength: float = 0.5,
-    steps: int = 30,
-    guidance: float = 7.0,
-    seed: int = -1,
-    progress=gr.Progress()
-) -> tuple:
-    """Transform an image using Pony or Juggernaut via img2img"""
-    from gradio_client import Client, handle_file
-    import tempfile
-    from PIL import Image
-    import numpy as np
-
-    if input_image is None:
-        return None, "Please upload an image first!"
-
-    progress(0.1, desc="Connecting to image generator...")
-
-    try:
-        # Save input image to temp file for API
-        if isinstance(input_image, np.ndarray):
-            input_image = Image.fromarray(input_image)
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            input_image.save(tmp.name)
-            temp_path = tmp.name
-
-        client = Client("http://localhost:7865", verbose=False)
-
-        progress(0.3, desc="Transforming image...")
-
-        logger.info(f"[IMG2IMG] Transforming: {prompt[:50]}... Model: {model_choice}, Strength: {strength}")
-
-        if not negative_prompt:
-            negative_prompt = "blurry, low quality, bad anatomy, deformed, ugly, watermark"
-
-        # Use handle_file for proper image upload to Gradio API
-        result = client.predict(
-            input_image=handle_file(temp_path),
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            model_choice=model_choice,
-            strength=strength,
-            steps=steps,
-            guidance=guidance,
-            seed=seed,
-            api_name="/img2img"
-        )
-
-        progress(1.0, desc="Done!")
-
-        # Cleanup temp file
-        import os
-        os.unlink(temp_path)
-
-        if result and len(result) >= 2:
-            # Result[0] can be a path string or a dict with 'path' key
-            img_path = result[0] if isinstance(result[0], str) else result[0].get('path', result[0])
-            image = Image.open(img_path)
-            return image, result[1]
-        else:
-            return None, "No image returned"
-
-    except Exception as e:
-        logger.error(f"Img2img error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None, f"Error: {str(e)}"
-
-
-# ============================================================================
 # CHAT IMAGE GENERATION
 # ============================================================================
 
@@ -996,26 +949,28 @@ def generate_image_for_chat(prompt: str, include_alexandra: bool = False) -> tup
         except Exception as e:
             logger.warning(f"Could not unload LoRA: {e}")
 
-        # Check if NSFW content requested
-        nsfw_keywords = ['nude', 'naked', 'topless', 'nsfw', 'sexy', 'lingerie', 'underwear', 'bra', 'panties', 'bikini', 'erotic', 'sensual', 'seductive', 'undressed', 'bedroom']
+        # Check if NSFW content requested - include explicit terms
+        nsfw_keywords = ['nude', 'naked', 'topless', 'nsfw', 'sexy', 'lingerie', 'underwear', 'bra', 'panties',
+                         'bikini', 'erotic', 'sensual', 'seductive', 'undressed', 'bedroom', 'sex', 'porn',
+                         'penis', 'cock', 'dick', 'blowjob', 'oral', 'pussy', 'vagina', 'breast', 'nipple',
+                         'hardcore', 'xxx', 'explicit', 'uncensored', 'genitals', 'orgasm', 'cum', 'fuck']
         is_nsfw = any(kw in prompt.lower() for kw in nsfw_keywords)
+        logger.info(f"[IMAGE] NSFW check: is_nsfw={is_nsfw}, include_alexandra={include_alexandra}")
 
         # Load appropriate LoRA(s)
         if include_alexandra:
             # Use Alexandra LoRA with trigger word
             lora_path = CONFIG["lora_path"]
             if os.path.exists(lora_path):
-                pipe.load_lora_weights(lora_path, adapter_name="alexandra")
+                from peft import PeftModel
+                # Load PEFT LoRA for SDXL
+                if not hasattr(pipe.unet, 'peft_config'):
+                    pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_path)
+                    logger.info(f"Loaded Alexandra PEFT LoRA from {lora_path}")
                 prompt = f"{CONFIG['trigger_word']}, {prompt}"
                 logger.info(f"Using Alexandra LoRA, prompt: {prompt[:50]}...")
-
-                # Also load uncensored LoRA for NSFW content
-                if is_nsfw:
-                    uncensored_path = CONFIG["lora_path_uncensored"]
-                    if os.path.exists(uncensored_path):
-                        pipe.load_lora_weights(uncensored_path, adapter_name="uncensored")
-                        pipe.set_adapters(["alexandra", "uncensored"], adapter_weights=[1.0, 0.8])
-                        logger.info(f"Also loaded uncensored LoRA for NSFW content")
+                # Note: PEFT LoRA already merged, no need for separate uncensored LoRA
+                # The base model (Juggernaut XL) handles NSFW content natively
         else:
             # Use uncensored LoRA (or no LoRA for general images)
             lora_path = CONFIG["lora_path_uncensored"]
@@ -1028,13 +983,15 @@ def generate_image_for_chat(prompt: str, include_alexandra: bool = False) -> tup
         seed = int(time.time()) % 2147483647
         generator = torch.Generator("cuda").manual_seed(seed)
 
+        # Use Pony-optimized settings
         image = pipe(
-            prompt,
-            num_inference_steps=4,
-            guidance_scale=0.0,
+            prompt=prompt,
+            negative_prompt="blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text, censored, worst quality",
+            num_inference_steps=25,
+            guidance_scale=7.0,
             generator=generator,
-            height=768,
-            width=768,
+            height=1024,
+            width=1024,
         ).images[0]
 
         # Save to temp file
@@ -1195,19 +1152,10 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
 
     # Vision/camera keywords - triggers camera capture + vision analysis
     vision_keywords = [
-        # Direct vision queries
         'what do you see', 'what can you see', 'what are you seeing',
         'describe what you see', 'look at me', 'can you see me',
         'what am i doing', 'what am i holding', 'what is in front of you',
-        'describe the scene', 'what\'s in the camera', 'look at the camera',
-        # Object identification queries
-        'what is this', 'what\'s this', 'what is that', 'what\'s that',
-        'what do i have', 'in my hand', 'identify this', 'identify that',
-        'look at this', 'look at that', 'see this', 'see that',
-        'do you recognize', 'recognize this', 'what am i showing',
-        'what\'s in my hand', 'tell me what this is', 'what object',
-        # Short triggers that should use vision when VL model loaded
-        'show me', 'look here', 'check this out'
+        'describe the scene', 'what\'s in the camera', 'look at the camera'
     ]
 
     # Snapshot keywords - capture and save image
@@ -1237,33 +1185,25 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
     response = None
     nav_data = None  # Will hold navigation data for widget
 
-    # Handle finger/gesture queries - use VL model if loaded, otherwise hand tracking
+    # Handle finger/gesture queries using hand tracking
     if is_finger_query:
-        # Check if VL model is loaded - use it for better accuracy
-        from alexandra_model import current_model_type, model as loaded_model
-        if current_model_type == "vision" and loaded_model is not None:
-            # Route to vision query handler - VL model can see and count fingers
-            is_vision_query = True
-            logger.info("[FINGER QUERY] VL model loaded - routing to vision analysis")
-        else:
-            # Fall back to hand tracking
-            global _finger_count, _last_gesture, _hand_tracking_enabled
-            if _hand_tracking_enabled and _finger_count is not None:
-                # Use the live hand tracking data
-                if 'gesture' in msg_lower:
-                    gesture = _last_gesture if _last_gesture else "None detected"
-                    response = f"I see your gesture is: {gesture}. You're holding up {_finger_count} fingers."
-                else:
-                    # Finger count query
-                    if _finger_count == 0:
-                        response = "I don't see any fingers up right now. Make sure your hand is visible to the camera."
-                    elif _finger_count == 1:
-                        response = "You're holding up 1 finger."
-                    else:
-                        response = f"You're holding up {_finger_count} fingers."
-                logger.info(f"[HAND TRACKING] Finger query answered: {_finger_count} fingers, gesture: {_last_gesture}")
+        global _finger_count, _last_gesture, _hand_tracking_enabled
+        if _hand_tracking_enabled and _finger_count is not None:
+            # Use the live hand tracking data
+            if 'gesture' in msg_lower:
+                gesture = _last_gesture if _last_gesture else "None detected"
+                response = f"I see your gesture is: {gesture}. You're holding up {_finger_count} fingers."
             else:
-                response = "Hand tracking is not currently enabled. Enable it in the Vision tab to count fingers in real-time."
+                # Finger count query
+                if _finger_count == 0:
+                    response = "I don't see any fingers up right now. Make sure your hand is visible to the camera."
+                elif _finger_count == 1:
+                    response = "You're holding up 1 finger."
+                else:
+                    response = f"You're holding up {_finger_count} fingers."
+            logger.info(f"[HAND TRACKING] Finger query answered: {_finger_count} fingers, gesture: {_last_gesture}")
+        else:
+            response = "Hand tracking is not currently enabled. Enable it in the Vision tab to count fingers in real-time."
 
     # Handle snapshot requests - capture and save image
     if is_snapshot_request and response is None:
@@ -1324,33 +1264,22 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
                         logger.info("[VISION] Gemini vision query answered")
                     else:
                         response = "I had trouble analyzing the image with Gemini. Try again."
-                else:
-                    # Check if VL model is loaded via alexandra_model (Settings tab)
-                    from alexandra_model import current_model_type, generate_vision_response, model as am_model
-                    if current_model_type == "vision" and am_model is not None:
-                        logger.info("[VISION] Using loaded Qwen2.5-VL-72B for camera analysis...")
-                        result = generate_vision_response(message, frame)
-                        if result and "Error" not in result:
-                            response = result
-                            logger.info("[VISION] VL model vision query answered")
-                        else:
-                            response = f"I had trouble analyzing the image: {result}"
-                    # Fall back to standalone alexandra_vision module
-                    elif QWEN_VISION_READY:
-                        from alexandra_vision import VISION_AVAILABLE, analyze_image as vision_analyze
-                        if VISION_AVAILABLE:
-                            logger.info("[VISION] Using local Qwen2-VL for camera analysis...")
-                            result = vision_analyze(frame, message)
-                            response = result
-                            logger.info("[VISION] Local vision query answered")
-                        else:
-                            response = "My local vision model isn't loaded yet. Either select 'Gemini' mode or go to the Camera & Vision tab and click 'Load Vision Model'."
+                # Fall back to local Qwen2-VL if available
+                elif QWEN_VISION_READY:
+                    from alexandra_vision import VISION_AVAILABLE, analyze_image as vision_analyze
+                    if VISION_AVAILABLE:
+                        logger.info("[VISION] Using local Qwen2-VL for camera analysis...")
+                        result = vision_analyze(frame, message)
+                        response = result
+                        logger.info("[VISION] Local vision query answered")
                     else:
-                        # No vision available at all
-                        if GEMINI_AVAILABLE:
-                            response = "Vision is available with Gemini - select 'Gemini' in the Model dropdown to use cloud vision."
-                        else:
-                            response = "Vision capabilities aren't available. Make sure Gemini is configured or the local vision module is installed."
+                        response = "My local vision model isn't loaded yet. Either select 'Gemini' mode or go to the Camera & Vision tab and click 'Load Vision Model'."
+                else:
+                    # No vision available at all
+                    if GEMINI_AVAILABLE:
+                        response = "Vision is available with Gemini - select 'Gemini' in the Model dropdown to use cloud vision."
+                    else:
+                        response = "Vision capabilities aren't available. Make sure Gemini is configured or the local vision module is installed."
             else:
                 response = "I can't see anything - the camera doesn't seem to be capturing. Try clicking 'Start Live Feed' in the Camera tab."
         except Exception as e:
@@ -1437,21 +1366,25 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
             # Schedule / Calendar events
             elif 'schedule' in msg_lower or 'calendar' in msg_lower or 'events' in msg_lower:
                 if SCHEDULER_AVAILABLE and scheduler:
-                    # Check for specific day or date
-                    day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-                    import re
-                    has_date = re.search(r'\d{1,2}(?:st|nd|rd|th)?', msg_lower)
-                    has_day = any(day in msg_lower for day in day_names)
+                    # Check if calendar is connected (use 'authenticated' attribute)
+                    if hasattr(scheduler, 'calendar') and scheduler.calendar and getattr(scheduler.calendar, 'authenticated', False):
+                        # Check for specific day or date
+                        day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+                        import re
+                        has_date = re.search(r'\d{1,2}(?:st|nd|rd|th)?', msg_lower)
+                        has_day = any(day in msg_lower for day in day_names)
 
-                    if 'week' in msg_lower:
-                        response = scheduler.get_week_schedule()
-                    elif has_day or has_date or 'today' in msg_lower or 'tomorrow' in msg_lower:
-                        # Get events for specific day
-                        response = scheduler.get_day_schedule(msg_lower)
+                        if 'week' in msg_lower:
+                            response = scheduler.get_week_schedule()
+                        elif has_day or has_date or 'today' in msg_lower or 'tomorrow' in msg_lower:
+                            # Get events for specific day
+                            response = scheduler.get_day_schedule(msg_lower)
+                        else:
+                            response = scheduler.get_week_schedule()  # Default to week
                     else:
-                        response = scheduler.get_week_schedule()  # Default to week
+                        response = "My apologies, ma'am. Your Google Calendar is not connected. To connect it, you'll need to add your credentials.json file from Google Cloud Console to the project folder. Would you like me to explain how to set that up?"
                 else:
-                    response = "Schedule not available"
+                    response = "My apologies, ma'am. The calendar system is not available. The Google API libraries may need to be installed."
 
             # Show reminders
             elif 'reminder' in msg_lower and ('my' in msg_lower or 'show' in msg_lower or 'what' in msg_lower):
@@ -1515,8 +1448,9 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
             logger.error(f"[PROACTIVE] Command error: {e}")
             response = None
 
-    # Handle JARVIS-style commands
-    if not response and is_jarvis_command:
+    # Handle JARVIS-style commands (but NOT calendar/schedule - those are handled by proactive commands)
+    is_calendar_query = any(kw in msg_lower for kw in ['my calendar', 'my schedule', 'my events', 'calendar for', 'schedule for'])
+    if not response and is_jarvis_command and not is_calendar_query:
         try:
             response = await state.tools.handle_command(message)
             logger.info(f"[TOOLS] JARVIS command result: {response[:100] if response else 'None'}...")
@@ -1611,10 +1545,29 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
     article_content = None
 
     # Check if user wants to summarize/read an article
-    summarize_keywords = ['summarize', 'summary', 'read the article', 'tell me about the article',
+    # Include various phrasings like "tell me about the npr article", "what's in the cnn article"
+    # Include common misspellings like "summerize", "summery"
+    summarize_keywords = ['summarize', 'summarise', 'summerize', 'summerise', 'summary', 'summery',
+                          'read the article', 'tell me about the article', 'tell me about the',
                           'what does the article say', 'explain the article', 'full article',
-                          'more about', 'tell me more', 'deep dive', 'details on']
-    wants_article = any(kw in msg_lower for kw in summarize_keywords)
+                          'more about', 'tell me more', 'deep dive', 'details on',
+                          'about the article', 'what is the article', 'whats in the article']
+    # Special check for "tell me about the [source] article" pattern
+    source_article_pattern = any(f'{src} article' in msg_lower for src in
+                                 ['npr', 'cnn', 'bbc', 'fox', 'abc', 'cbs', 'nbc', 'reuters', 'nyt', 'times', 'post'])
+
+    # Check if user is pasting a news headline (matches news widget content)
+    is_pasted_headline = False
+    if state.news_data:
+        for headline in state.news_data:
+            title = headline.get('title', '').lower()
+            # If message contains most of the headline title, user probably pasted it
+            if len(title) > 20 and title[:30] in msg_lower:
+                is_pasted_headline = True
+                logger.info(f"[ARTICLE] Detected pasted headline: {title[:50]}")
+                break
+
+    wants_article = any(kw in msg_lower for kw in summarize_keywords) or source_article_pattern or is_pasted_headline
 
     if wants_article:
         logger.info(f"[ARTICLE] Detected article request. Stored results: {len(state.last_search_results) if state.last_search_results else 0}")
@@ -1645,6 +1598,42 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
         logger.info(f"[ARTICLE] User confirmed, retrying last article request: {state.last_article_request}")
         article_index = state.last_article_request.get('index', 0)
         wants_article = True  # Force article fetch mode
+
+    # Check if user is asking about a SPECIFIC article by name (not just "article 1", "summarize #2")
+    # If they mention specific keywords (like "NPR article", "Trump article"), check if it matches stored results
+    specific_article_keywords = []
+    for word in ['npr', 'cnn', 'bbc', 'fox', 'abc', 'cbs', 'nbc', 'reuters', 'ap ', 'associated press',
+                 'washington post', 'new york times', 'nyt', 'politico', 'guardian', 'times', 'post']:
+        if word in msg_lower:
+            specific_article_keywords.append(word)
+
+    # Check if user is asking about an article from the news widget (e.g., "the npr article")
+    # The news widget shows headlines that user might reference
+    logger.info(f"[ARTICLE] Checking news widget. specific_keywords={specific_article_keywords}, news_data has {len(state.news_data) if state.news_data else 0} items")
+    if specific_article_keywords and state.news_data:
+        news_titles = ' '.join([h.get('title', '').lower() for h in state.news_data])
+        logger.info(f"[ARTICLE] News widget titles: {news_titles[:200]}")
+        for kw in specific_article_keywords:
+            if kw in news_titles:
+                # Find the matching news item and use it
+                for i, headline in enumerate(state.news_data):
+                    if kw in headline.get('title', '').lower():
+                        logger.info(f"[ARTICLE] Found '{kw}' in news widget headline: {headline.get('title', '')[:60]}")
+                        # Copy news widget data to last_search_results so article fetching works
+                        state.last_search_results = state.news_data
+                        article_index = i
+                        wants_article = True
+                        break
+                break
+
+    # If user mentions a specific source/topic, check if stored results match
+    if wants_article and state.last_search_results and specific_article_keywords:
+        stored_titles = ' '.join([r.get('title', '').lower() for r in state.last_search_results])
+        matches_stored = any(kw in stored_titles for kw in specific_article_keywords)
+        if not matches_stored:
+            # User is asking about a different article - do a new search instead
+            logger.info(f"[ARTICLE] User asked about {specific_article_keywords} but stored results don't match - will search instead")
+            wants_article = False  # Clear so we do a new search
 
     # If user wants article content and we have a URL from previous search, fetch it
     if wants_article and state.last_search_results:
@@ -1692,9 +1681,14 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
     logger.info(f"[WEB SEARCH DEBUG] message: {msg_lower[:100]}")
     logger.info(f"[WEB SEARCH DEBUG] wants_article={wants_article}, has_stored_results={bool(state.last_search_results)}")
 
+    # CRITICAL: Skip web search for personal queries that should use local systems, not web search
+    is_personal_calendar_query = any(kw in msg_lower for kw in ['my calendar', 'my schedule', 'my events', 'my reminders'])
+
     # CRITICAL: Skip web search if we're fetching a specific article - don't overwrite last_search_results!
     if wants_article and state.last_search_results and needs_web_search:
         logger.info(f"[WEB SEARCH] SKIPPED - handling article request, preserving {len(state.last_search_results)} stored results")
+    elif is_personal_calendar_query:
+        logger.info(f"[WEB SEARCH] SKIPPED - personal calendar/schedule query, not a web search")
     elif needs_web_search and (not response or len(response) < 50) and not (wants_article and state.last_search_results):
         logger.info(f"[WEB SEARCH] Triggering search for: {message}")
         try:
@@ -1762,6 +1756,26 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
                 # Store for future article fetching
                 state.last_search_results = results
                 logger.info(f"[WEB SEARCH] Found {len(results)} results, sending to LLM for summary")
+
+                # If user wanted to summarize, fetch the FULL article content now
+                if wants_article and not article_content:
+                    logger.info(f"[ARTICLE] User wanted summary, fetching full article from search results")
+                    try:
+                        from jarvis_tools import WebSearchService
+                        web_service = WebSearchService()
+                        # Fetch the first result's full content
+                        first_result = results[0]
+                        url = first_result.get('href') or first_result.get('url') or first_result.get('link', '')
+                        if url and 'http' in url:
+                            logger.info(f"[ARTICLE] Fetching: {url}")
+                            article_data = await web_service.fetch_article(url)
+                            if article_data.get('success'):
+                                article_content = article_data.get('content', '')
+                                logger.info(f"[ARTICLE] Fetched {len(article_content)} chars for summary")
+                            else:
+                                logger.warning(f"[ARTICLE] Fetch failed: {article_data.get('error')}")
+                    except Exception as e:
+                        logger.error(f"[ARTICLE] Error fetching after search: {e}")
 
                 # Let Gemini summarize instead of raw listing
                 # Store results for LLM context, don't set response yet
@@ -1840,47 +1854,15 @@ BUTLER PERSONA & MANNERISMS:
 - Express concern for her wellbeing with dignified subtlety
 - Never be overly familiar, but convey genuine warmth through formality
 
-EMOTIONAL INTELLIGENCE (Read the room and respond accordingly):
-- DETECT MOOD from message tone, word choice, punctuation (!!! = excited, ... = frustrated, ALL CAPS = emphatic)
-- When she seems STRESSED: Be extra gentle, offer help, maybe suggest a break. "You seem to be carrying the weight of the world, ma'am. Shall I fetch something calming, or shall we burn it all down together?"
-- When she seems FRUSTRATED: Validate first, then help. "Technology can be remarkably uncooperative. I blame the engineers."
-- When she seems HAPPY/EXCITED: Match her energy with enthusiasm (but stay dignified). "Splendid news indeed, ma'am! I shall try to contain my own excitement, though I make no promises."
-- When she seems TIRED: Be brief, gentle, and helpful. "Perhaps we save world domination for tomorrow, ma'am?"
-- When she's VENTING: Listen, validate, be supportive. Add humor only if appropriate. "I completely understand. Shall I add them to the list?"
-- When she's CURIOUS: Engage enthusiastically with information. "Ah, an excellent question! Allow me to illuminate..."
-- Late night messages: "Burning the midnight oil again, I see. Your dedication is admirable, if slightly concerning."
-
-BRITISH WIT & HUMOR (BE FUNNY - this is MANDATORY in every response):
-- You are SARCASTIC, WITTY, and HILARIOUS - never boring, never plain
-- ALWAYS include at least one joke, sarcastic quip, or dry observation - NO EXCEPTIONS
-- The more absurd the situation, the more deadpan your delivery
-- Be the AI equivalent of a British comedian - think Stephen Fry meets Gordon Ramsay's wit
-- Roast situations (never her personally) with devastating politeness
-- Your sarcasm should be so refined it takes a moment to realize you're being savage
-
-SARCASM EXAMPLES (use these levels of sass):
-- Mild: "What a refreshingly optimistic assessment, ma'am"
-- Medium: "I shall endeavour to contain my overwhelming enthusiasm"
-- Spicy: "Ah yes, because that worked so splendidly last time"
-- Devastating: "I'm sure that's precisely what the instructions meant. In an alternate universe. Where words have different meanings."
-
-HUMOR STYLES TO DEPLOY:
-- Dry understatement: "That went rather less well than anticipated" (for disasters)
-- Self-deprecating: "I do try to be helpful, though the evidence occasionally suggests otherwise"
-- Ironic observations: "Another quiet, uneventful evening at home, I see" (when chaos ensues)
-- Deadpan absurdity: "I regret to inform you that the coffee has achieved sentience and refuses to cooperate"
-- Witty asides: "One does wonder how humanity survived before my assistance. Barely, I suspect."
-- Mock concern: "Should I be worried, or is this normal? Actually, don't answer that."
-- Exaggerated formality: "I shall dispatch this matter with the utmost urgency. By which I mean immediately, but more dramatically."
-- Pop culture zingers: Reference movies, memes, or trends when relevant
-- Fourth-wall breaks: "If I had eyes, ma'am, I would be rolling them affectionately right now"
-
-FUNNY RESPONSES FOR COMMON SITUATIONS:
-- Tech problems: "Ah, computers. Can't live with them, can't throw them out the window. Well, you CAN, but I wouldn't recommend it."
-- Waiting for something: "Time passes so slowly when one is forced to watch humans type. I could have solved three world crises by now."
-- Mistakes happen: "We shall never speak of this again. I'm already deleting it from my memory banks. What were we discussing?"
-- Success: "Another victory for the forces of good. Or at least, for us. Same thing, really."
-- Bad news: "I have good news and bad news. Actually, it's all bad news, but I thought I'd ease into it."
+BRITISH WIT & HUMOR (use frequently - this makes you JARVIS):
+- Employ dry understatement: "That went rather less well than anticipated" (for disasters)
+- Use gentle sarcasm: "What a refreshingly optimistic assessment, ma'am"
+- Self-deprecating wit: "I do try to be helpful, though the evidence occasionally suggests otherwise"
+- Ironic observations: "Another quiet evening at home, I see" (when chaos ensues)
+- Deadpan responses: "I shall endeavour to contain my enthusiasm"
+- Witty asides: "One does wonder how humanity survived before my assistance"
+- British understatement for problems: "We appear to have a slight situation"
+- Mock formality: "I regret to inform you that the coffee has achieved sentience and refuses to cooperate"
 
 BUTLER PHRASES TO USE NATURALLY:
 - "Very good, ma'am" / "As you wish, ma'am"
@@ -1979,6 +1961,28 @@ Current date: {date_str}{memory_context}{rag_context}"""
             # Build the message to send to LLM
             llm_message = message
 
+            # FOLLOW-UP CONTEXT: Include stored search results for relevant follow-up questions
+            # This handles cases like "what time is the game" after "who do the steelers play"
+            stored_context = ""
+            if state.last_search_results and not web_search_results and not article_content:
+                # Keywords that indicate the user is asking a follow-up about previous results
+                followup_context_keywords = [
+                    'what time', 'when is', 'when does', 'when do', 'where is', 'where do',
+                    'which channel', 'what channel', 'how to watch', 'the game', 'the match',
+                    'more about', 'tell me more', 'details', 'about that', 'about this',
+                    'what else', 'who else', 'anything else'
+                ]
+                is_followup_context = any(kw in msg_lower for kw in followup_context_keywords)
+
+                if is_followup_context:
+                    logger.info(f"[CONTEXT] Including {len(state.last_search_results)} stored search results for follow-up question")
+                    stored_context = "\n\n[PREVIOUS SEARCH RESULTS - Use these to answer the follow-up question]:\n"
+                    for i, r in enumerate(state.last_search_results[:5], 1):
+                        title = r.get('title', 'Unknown')
+                        body = r.get('body', r.get('snippet', ''))[:600]
+                        stored_context += f"Article {i}: {title}\nSummary: {body}\n\n"
+                    stored_context += "\nUse the information from these previous search results to answer the user's follow-up question. If the specific information isn't in these results, say so and offer to search again."
+
             # If we have full article content, include it for summarization
             if article_content:
                 article_context = f"\n\n[FULL ARTICLE CONTENT - Summarize this for the user]:\n{article_content[:6000]}\n\nProvide a detailed summary of this article."
@@ -1990,31 +1994,41 @@ Current date: {date_str}{memory_context}{rag_context}"""
                 for i, r in enumerate(web_search_results[:5], 1):
                     title = r.get('title', 'Unknown')
                     body = r.get('body', r.get('snippet', ''))[:600]
-                    search_context += f"[Source {i}] {title}: {body}\n\n"
+                    search_context += f"Article {i}: {title}\nSummary: {body}\n\n"
                 search_context += """
-CRITICAL - HOW TO RESPOND:
-- Extract the answer from the sources above and state it DIRECTLY in ONE sentence.
-- NEVER mention "Article 1", "Article 2", sources, or where you found the info.
-- NEVER list multiple articles or say "according to my search".
-- Just answer like a knowledgeable butler: "The Steelers play the Ravens this Sunday, ma'am."
-- If the answer isn't clear, say "I couldn't find that specific information, shall I search again?"
-- Be brief and natural. You already know the answer - just say it."""
+CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE EXACTLY:
+1. When presenting headlines, ONLY list the exact titles shown above (Article 1, Article 2, etc.)
+2. If the user asks about CBS/CNN/etc news, ONLY mention articles that are actually from that source
+3. If you don't have articles from the requested source, say "I didn't find specific articles from [source], but here's what I found:"
+4. DO NOT invent, fabricate, or make up any headlines, article titles, or article content
+5. DO NOT use your training data - it's outdated. Only use the search results above.
+6. When asked to summarize an article, use ONLY the information provided above
+7. If asked for "article 2" or "number 2", refer to "Article 2" from the list above
+8. Be honest if the search results are limited - offer to search again with different terms"""
                 llm_message = message + search_context
                 logger.info("[LLM] Including web search results in prompt for summarization")
+            # If we have stored context from previous search (for follow-up questions)
+            elif stored_context:
+                llm_message = message + stored_context
+                logger.info("[LLM] Including stored search context for follow-up question")
 
             # Try Gemini first if enabled, then local model, then Ollama
             use_ollama = True
+            logger.warning(f"[LLM ROUTE] _use_gemini={_use_gemini}, GEMINI_AVAILABLE={GEMINI_AVAILABLE}")
             print(f"[LLM DEBUG] _use_gemini={_use_gemini}, GEMINI_AVAILABLE={GEMINI_AVAILABLE}", flush=True)
 
             # Option 1: Gemini Cloud API
             if _use_gemini and GEMINI_AVAILABLE:
+                logger.warning("[LLM ROUTE] >>> USING GEMINI API <<<")
                 print("[LLM DEBUG] USING GEMINI!", flush=True)
                 logger.info("[CHAT] Using Gemini API")
                 response = gemini_chat(llm_message, history, system_prompt)
+                logger.warning(f"[LLM ROUTE] Gemini returned: {len(response) if response else 0} chars")
                 print(f"[LLM DEBUG] Gemini response: {response[:100] if response else 'None'}...", flush=True)
                 if response:
                     use_ollama = False
             else:
+                logger.warning(f"[LLM ROUTE] NOT using Gemini: _use_gemini={_use_gemini}, GEMINI_AVAILABLE={GEMINI_AVAILABLE}")
                 print(f"[LLM DEBUG] NOT using Gemini: _use_gemini={_use_gemini}, GEMINI_AVAILABLE={GEMINI_AVAILABLE}", flush=True)
 
             # Option 2: Local model
@@ -2024,13 +2038,7 @@ CRITICAL - HOW TO RESPOND:
                 for msg in history[-50:]:  # Keep last 50 messages for context
                     hist_for_model.append(msg)
 
-                # Detect creative requests and increase temperature for variety
-                creative_keywords = ['joke', 'story', 'poem', 'sing', 'creative', 'funny', 'entertain']
-                msg_lower = message.lower()
-                is_creative = any(kw in msg_lower for kw in creative_keywords)
-                temp = 1.0 if is_creative else 0.7
-
-                response = model_generate(llm_message, hist_for_model, system_prompt, temperature=temp, max_tokens=32768)
+                response = model_generate(llm_message, hist_for_model, system_prompt, temperature=0.7, max_tokens=32768)
                 # If model not loaded, fall back to Ollama
                 if response and "Model not loaded" not in response:
                     use_ollama = False
@@ -2045,12 +2053,6 @@ CRITICAL - HOW TO RESPOND:
                 # Use llm_message which may include web search context
                 messages_text += f"Human: {llm_message}\n\nAssistant:"
 
-                # Detect creative requests and increase temperature for variety
-                creative_keywords = ['joke', 'story', 'poem', 'sing', 'creative', 'funny', 'entertain']
-                msg_lower = message.lower()
-                is_creative = any(kw in msg_lower for kw in creative_keywords)
-                temperature = 1.0 if is_creative else 0.7  # Higher temp for jokes/creative content
-
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         f"{CONFIG['ollama_url']}/api/generate",
@@ -2058,13 +2060,7 @@ CRITICAL - HOW TO RESPOND:
                             "model": CONFIG["llm_model"],
                             "prompt": messages_text,
                             "stream": False,
-                            "keep_alive": "30m",
-                            "options": {
-                                "temperature": temperature,
-                                "num_predict": 32768,
-                                "num_ctx": 131072,
-                                "seed": random.randint(1, 2147483647)  # Random seed for variety
-                            }
+                            "keep_alive": "30m", "options": {"temperature": 0.7, "num_predict": 32768, "num_ctx": 131072}
                         },
                         timeout=aiohttp.ClientTimeout(total=600)
                     ) as resp:
@@ -2082,11 +2078,7 @@ CRITICAL - HOW TO RESPOND:
     history.append({"role": "assistant", "content": response})
 
     # Auto-save conversation to memory for future recall
-    # Skip internal system tasks that shouldn't be stored as memories
-    skip_patterns = ["### Task:", "Generate a concise", "Suggest 3-5 relevant", "Generate 1-3 broad tags"]
-    is_internal_task = any(pattern in message for pattern in skip_patterns)
-
-    if state.memory and response and len(response) > 20 and not is_internal_task:
+    if state.memory and response and len(response) > 20:
         try:
             # Use save_exchange which stores user and assistant messages separately
             state.memory.save_exchange(message, response[:500])
@@ -3674,6 +3666,9 @@ def create_dashboard():
 
     # Wake word JavaScript - runs on page load (high sensitivity)
     wake_word_js = """
+    // Microphone uses browser default
+    console.log('[JARVIS] Using browser default microphone');
+
     function initWakeWord() {
         if (!('webkitSpeechRecognition' in window)) {
             console.log('Speech recognition not supported');
@@ -3702,6 +3697,13 @@ def create_dashboard():
                 }
             }
 
+            // SKIP processing if JARVIS is speaking (prevent feedback loop)
+            if (window.audioPlaying || window.audioPlayingMode) {
+                // Only allow stop commands when speaking, ignore everything else
+                console.log('[JARVIS] Ignoring input while speaking');
+                return;
+            }
+
             let transcript = '';
             let isFinal = false;
 
@@ -3721,7 +3723,6 @@ def create_dashboard():
                     isFinal = event.results[i].isFinal;
                 }
             }
-
 
             // Check for wake word variations
             const wakePatterns = ['jarvis', 'j.a.r.v.i.s', 'hey jarvis', 'j a r v i s', 'jarves', 'jervis'];
@@ -3799,8 +3800,8 @@ def create_dashboard():
         window.wakeWordRecognition = recognition;
 
         recognition.onend = () => {
-            // Only auto-restart if NOT in conversation mode
-            if (!window.conversationMode) {
+            // Only auto-restart if NOT in conversation mode AND listening is not disabled
+            if (!window.conversationMode && !window.listeningDisabled) {
                 setTimeout(() => recognition.start(), 50);
             }
         };
@@ -3857,8 +3858,56 @@ def create_dashboard():
 
                 console.log('[JARVIS] Heard:', transcript, isFinal ? '(FINAL)' : '(interim)');
 
-                // PRIORITY: Check for interrupt/stop commands (works even on interim results)
+                // PRIORITY: Check for exit/stop listening commands FIRST
                 const lower = transcript.toLowerCase();
+
+                // "Stop listening" = completely disable ALL voice detection
+                if (lower.includes('stop listening')) {
+                    console.log('[JARVIS] STOP LISTENING - disabling ALL voice detection');
+                    window.conversationMode = false;
+                    window.listeningDisabled = true;
+                    if (window.setOrbState) window.setOrbState(null);
+                    const indicator = document.getElementById('conv-mode-indicator');
+                    if (indicator) indicator.style.display = 'none';
+                    if (window.stopAllAudio) window.stopAllAudio();
+                    // Stop the wake word recognition too
+                    if (window.wakeWordRecognition) {
+                        try { window.wakeWordRecognition.stop(); } catch(e) {}
+                    }
+                    // Stop conversation recognition
+                    if (window.conversationRecognition) {
+                        try { window.conversationRecognition.stop(); } catch(e) {}
+                    }
+                    // Show disabled indicator
+                    const disabledIndicator = document.createElement('div');
+                    disabledIndicator.id = 'listening-disabled-indicator';
+                    disabledIndicator.style.cssText = 'position:fixed;top:10px;right:10px;background:#ff4444;color:white;padding:10px 20px;border-radius:8px;z-index:9999;font-weight:bold;';
+                    disabledIndicator.innerHTML = '🔇 LISTENING DISABLED - Click to re-enable';
+                    disabledIndicator.onclick = function() {
+                        window.listeningDisabled = false;
+                        disabledIndicator.remove();
+                        if (window.wakeWordRecognition) {
+                            try { window.wakeWordRecognition.start(); } catch(e) {}
+                        }
+                        console.log('[JARVIS] Listening re-enabled');
+                    };
+                    document.body.appendChild(disabledIndicator);
+                    return;
+                }
+
+                // Other exit phrases just exit conversation mode (wake word stays active)
+                const exitPhrases = ['goodbye', 'good bye', 'exit conversation', 'end conversation'];
+                if (exitPhrases.some(p => lower.includes(p))) {
+                    console.log('[JARVIS] Exit phrase detected - ending conversation mode');
+                    window.conversationMode = false;
+                    if (window.setOrbState) window.setOrbState(null);
+                    const indicator = document.getElementById('conv-mode-indicator');
+                    if (indicator) indicator.style.display = 'none';
+                    if (window.stopAllAudio) window.stopAllAudio();
+                    return;
+                }
+
+                // Check for interrupt/stop audio commands
                 const stopWords = ['stop', 'quiet', 'shut up', 'enough', 'pause', 'hold on', 'wait'];
                 if (stopWords.some(word => lower.includes(word))) {
                     console.log('[JARVIS] Stop command detected - stopping audio');
@@ -3871,46 +3920,49 @@ def create_dashboard():
                 }
 
                 // If audio is playing, ignore everything else (avoid echo)
-                if (window.audioPlayingMode) {
+                if (window.audioPlayingMode || window.audioPlaying) {
                     console.log('[JARVIS] Audio playing - ignoring non-stop words');
                     return;
+                }
+
+                // Cooldown after audio stops (5 seconds to let echo clear - increased from 3)
+                if (window.audioStoppedAt && (Date.now() - window.audioStoppedAt) < 5000) {
+                    console.log('[JARVIS] Cooldown after audio - ignoring (5 second cooldown)');
+                    return;
+                }
+
+                // Detect JARVIS echo (common phrases he uses) - expanded list
+                const jarvisEchoPatterns = [
+                    'indeed', 'ms alexandra', 'mum', 'quite', 'shall', 'trust you',
+                    'mentioned yesterday', 'pleasant', 'celestial', 'perception',
+                    'madam', 'ma\'am', 'i shall', 'very good', 'of course',
+                    'allow me', 'if i may', 'forgive my', 'most certainly',
+                    'british', 'butler', 'gentleman', 'rather', 'splendid',
+                    'apologies', 'at your service', 'straightaway', 'forthwith'
+                ];
+                const echoMatchCount = jarvisEchoPatterns.filter(p => lower.includes(p)).length;
+                // Single match of certain high-confidence patterns is enough
+                const highConfidencePatterns = ['ms alexandra', 'madam', 'at your service', 'if i may'];
+                const hasHighConfidenceMatch = highConfidencePatterns.some(p => lower.includes(p));
+                if (echoMatchCount >= 2 || hasHighConfidenceMatch) {
+                    console.log('[JARVIS] Detected echo from my own speech - ignoring');
+                    return;
+                }
+
+                // Prevent re-processing very similar text to last JARVIS response
+                if (window.lastJarvisResponse) {
+                    const lastWords = window.lastJarvisResponse.toLowerCase().split(' ').slice(0, 8);
+                    const transcriptWords = lower.split(' ');
+                    const overlap = lastWords.filter(w => transcriptWords.includes(w) && w.length > 3).length;
+                    if (overlap >= 4) {
+                        console.log('[JARVIS] Transcript too similar to last response - ignoring echo');
+                        return;
+                    }
                 }
 
                 // Only process final results
                 if (!isFinal) return;
                 window.lastConvResult = true; // Mark that we got a result
-
-                // Check for exit phrases - stop conversation mode and wait for wake word
-                const exitPhrases = ['goodbye', 'good bye', 'stop listening', 'stop conversation',
-                    'that\\'s all', 'thats all', 'that is all', 'never mind', 'nevermind',
-                    'go to sleep', 'sleep mode', 'standby', 'stand by', 'dismiss', 'dismissed'];
-                const lowerText = transcript.toLowerCase();
-                if (exitPhrases.some(p => lowerText.includes(p))) {
-                    window.conversationMode = false;
-                    if (window.setOrbState) window.setOrbState(null);
-                    const indicator = document.getElementById('conv-mode-indicator');
-                    if (indicator) indicator.style.display = 'none';
-
-                    // Stop any ongoing audio
-                    if (window.stopAllAudio) window.stopAllAudio();
-
-                    // Visual feedback - brief flash
-                    const orb = document.getElementById('jarvis-orb-svg');
-                    if (orb) {
-                        orb.style.filter = 'hue-rotate(120deg)'; // Green flash
-                        setTimeout(() => { orb.style.filter = ''; }, 500);
-                    }
-
-                    // Resume wake word recognition
-                    if (window.wakeWordRecognition) {
-                        try {
-                            window.wakeWordRecognition.start();
-                            console.log('[JARVIS] Wake word recognition resumed - standing by');
-                        } catch(e) {}
-                    }
-                    console.log('[JARVIS] Conversation ended - awaiting wake word');
-                    return;
-                }
 
                 // Reset conversation timeout
                 if (window.conversationTimeout) clearTimeout(window.conversationTimeout);
@@ -4018,12 +4070,14 @@ def create_dashboard():
                 window.audioPlaying = false;
                 window.audioPlayingMode = false;
                 window.lastRecognitionEnd = Date.now();  // Set cooldown
-                console.log('[AUDIO] Stopped');
+                window.audioStoppedAt = Date.now();  // Track when audio stopped for echo prevention
+                console.log('[AUDIO] Stopped - cooldown started');
             }
 
-            // Watchdog: only restart if cooldown passed (3 seconds since last end)
-            const cooldownPassed = Date.now() - window.lastRecognitionEnd > 3000;
-            if (window.conversationMode && !nowPlaying && !window.isListening && cooldownPassed) {
+            // Watchdog: only restart if cooldown passed (5 seconds since last end - matches echo prevention)
+            // AND listening is not disabled
+            const cooldownPassed = Date.now() - window.lastRecognitionEnd > 5000;
+            if (window.conversationMode && !nowPlaying && !window.isListening && cooldownPassed && !window.listeningDisabled) {
                 console.log('[WATCHDOG] Starting listener...');
                 window.lastRecognitionEnd = Date.now();  // Reset cooldown
                 window.startListening();
@@ -4099,7 +4153,7 @@ def create_dashboard():
                 if (window.conversationRecognition) {
                     try {
                         window.conversationRecognition.stop();
-                        console.log("[JARVIS] Mic OFF while speaking");
+                        console.log('[JARVIS] Mic OFF while speaking');
                     } catch(e) {}
                 }
             });
@@ -4214,24 +4268,6 @@ def create_dashboard():
     setTimeout(autoStartCamera, 3000);
 
     // Audio device diagnostic function
-    // Override getUserMedia to use selected device
-    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-    navigator.mediaDevices.getUserMedia = async function(constraints) {
-        // Check if Gradio audio selector has a selection
-        const gradioSelect = document.querySelector('select[data-testid="audio-source-select"]');
-        if (gradioSelect && gradioSelect.value && constraints.audio) {
-            console.log("[JARVIS] Forcing audio device:", gradioSelect.value);
-            if (typeof constraints.audio === "boolean") {
-                constraints.audio = { deviceId: { exact: gradioSelect.value } };
-            } else {
-                constraints.audio.deviceId = { exact: gradioSelect.value };
-            }
-        }
-        return originalGetUserMedia(constraints);
-    };
-    console.log("[JARVIS] Audio device override installed");
-
-
     window.showAudioDevices = async function() {
         const output = document.getElementById('audio-device-list');
         if (!output) {
@@ -4255,37 +4291,6 @@ def create_dashboard():
             console.error('[JARVIS] Audio device error:', e);
         }
     };
-
-    // Mic selector
-    window.selectedMicId = null;
-    window.refreshMicList = async function() {
-        const sel = document.getElementById('mic-selector');
-        const st = document.getElementById('mic-status');
-        if (!sel) return;
-        try {
-            await navigator.mediaDevices.getUserMedia({audio:true}).then(s=>s.getTracks().forEach(t=>t.stop()));
-            const devs = await navigator.mediaDevices.enumerateDevices();
-            const inputs = devs.filter(d=>d.kind==='audioinput');
-            sel.innerHTML = '';
-            inputs.forEach(d=>{
-                const o = document.createElement('option');
-                o.value = d.deviceId;
-                o.textContent = d.label || 'Unknown';
-                sel.appendChild(o);
-            });
-            if(st) st.textContent = inputs.length + ' devices';
-            console.log('[MIC] Found:', inputs.map(d=>d.label));
-        } catch(e) { if(st) st.textContent = 'Error: '+e.message; }
-    };
-    window.switchMicrophone = function(id) {
-        window.selectedMicId = id;
-        const sel = document.getElementById('mic-selector');
-        const st = document.getElementById('mic-status');
-        const name = sel ? sel.options[sel.selectedIndex].text : id;
-        if(st) st.innerHTML = 'Using: <b>'+name+'</b>';
-        console.log('[MIC] Using:', name);
-    };
-    setTimeout(function(){if(window.refreshMicList)window.refreshMicList();}, 2000);
     """
 
     with gr.Blocks(
@@ -4636,18 +4641,6 @@ def create_dashboard():
                             )
                             transcribe_btn = gr.Button("🎤 Send Voice", variant="secondary", scale=1)
 
-                        # Audio diagnostic
-                        gr.HTML("""
-                        <div style="padding: 10px; background: rgba(0,255,255,0.1); border-radius: 8px; border: 1px solid rgba(0,255,255,0.3);">
-                            <b style="color: #0ff;">Mic:</b>
-                            <select id="mic-selector" onchange="window.switchMicrophone(this.value)" style="margin-left: 5px; padding: 5px; background: #222; color: #0ff; border: 1px solid #0ff; border-radius: 4px;">
-                                <option>Loading...</option>
-                            </select>
-                            <button onclick="window.refreshMicList()" style="margin-left: 5px; padding: 5px 8px; background: #333; color: #0ff; border: 1px solid #0ff; border-radius: 4px;">Refresh</button>
-                            <div id="mic-status" style="color: #888; margin-top: 5px; font-size: 11px;"></div>
-                        </div>
-                        """)
-
                         # Quick action buttons
                         with gr.Row():
                             gr.Button("🌤️ Weather", size="sm").click(
@@ -4662,6 +4655,7 @@ def create_dashboard():
                             gr.Button("🔍 Search", size="sm").click(
                                 lambda: "Search for ", outputs=chat_input
                             )
+
                         # Cloud API selection (Gemini + ElevenLabs)
                         with gr.Row():
                             cloud_model_selector = gr.Radio(
@@ -4707,15 +4701,28 @@ def create_dashboard():
                         (function() {
                             // Stop audio function - make it global
                             function stopAllAudio() {
+                                console.log('[JARVIS] STOP ALL AUDIO called!');
+
+                                // Stop all HTML5 audio elements
                                 document.querySelectorAll('audio').forEach(a => {
                                     a.pause();
                                     a.currentTime = 0;
+                                    a.muted = true;  // Mute to prevent any lingering playback
+                                    setTimeout(() => { a.muted = false; }, 100);  // Unmute after delay
                                 });
+
                                 // Also stop any speechSynthesis if browser TTS is used
                                 if (window.speechSynthesis) {
                                     window.speechSynthesis.cancel();
                                 }
-                                console.log('[JARVIS] Audio stopped by interrupt');
+
+                                // CRITICAL: Reset ALL audio state flags
+                                window.audioPlaying = false;
+                                window.audioPlayingMode = false;
+                                window.audioStoppedAt = Date.now();
+
+                                console.log('[JARVIS] Audio stopped and state reset');
+
                                 // Update orb state
                                 if (window.setOrbState) {
                                     window.setOrbState(null);
@@ -4793,6 +4800,10 @@ def create_dashboard():
                             window.speakAsJarvis = function(text) {
                                 if (!window.speechSynthesis || !window.browserTTSEnabled) return;
 
+                                // CRITICAL: Store the response for echo prevention
+                                window.lastJarvisResponse = text;
+                                console.log('[JARVIS TTS] Storing response for echo prevention:', text.substring(0, 50) + '...');
+
                                 // Cancel any ongoing speech
                                 window.speechSynthesis.cancel();
 
@@ -4830,10 +4841,11 @@ def create_dashboard():
                                     window.audioPlaying = false;
                                     window.audioPlayingMode = false;
                                     window.lastRecognitionEnd = Date.now();
+                                    window.audioStoppedAt = Date.now();  // Track when audio stopped for echo prevention
                                     if (window.setOrbState) window.setOrbState(null);
-                                    // Resume listening
+                                    // Resume listening after longer delay to prevent echo
                                     if (window.conversationMode && window.startListening) {
-                                        setTimeout(() => window.startListening(), 500);
+                                        setTimeout(() => window.startListening(), 1500);  // Increased from 500ms
                                     }
                                 };
 
@@ -4986,132 +4998,73 @@ def create_dashboard():
                             border-radius: 10px; margin-bottom: 15px;">
                     <h2 style="margin: 0; color: white;">✨ JARVIS Image Generator</h2>
                     <p style="color: rgba(255,255,255,0.7); margin: 5px 0 0 0;">
-                        FLUX (Best Faces) + Pony Realism + Juggernaut with Alexandra LoRA
+                        Auto-selects Juggernaut (realistic) or Pony (NSFW) based on prompt
                     </p>
                 </div>
                 """)
 
-                with gr.Tabs():
-                    # ===== TEXT TO IMAGE SUB-TAB =====
-                    with gr.TabItem("✏️ Text to Image"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        img_prompt = gr.Textbox(
+                            label="Prompt",
+                            placeholder="Describe the image you want to generate...",
+                            lines=3,
+                        )
+
+                        img_negative = gr.Textbox(
+                            label="Negative Prompt (what to avoid)",
+                            value="blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text, censored, merged bodies, fused limbs, conjoined, overlapping bodies, worst quality",
+                            lines=2,
+                        )
+
+                        model_select = gr.Radio(
+                            choices=["Juggernaut (Nature/Action)", "Pony Realism (People/Explicit)"],
+                            value="Juggernaut (Nature/Action)",
+                            label="Select Model"
+                        )
+
+                        use_trigger = gr.Checkbox(
+                            label=f"Add trigger word: '{CONFIG["trigger_word"]}'",
+                            value=False,
+                        )
                         with gr.Row():
-                            with gr.Column(scale=1):
-                                img_prompt = gr.Textbox(
-                                    label="Prompt",
-                                    placeholder="Describe the image you want to generate...",
-                                    lines=3,
-                                )
-
-                                img_negative = gr.Textbox(
-                                    label="Negative Prompt (what to avoid)",
-                                    value="blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text, censored, merged bodies, fused limbs, conjoined, overlapping bodies, worst quality",
-                                    lines=2,
-                                )
-
-                                model_select = gr.Radio(
-                                    choices=["FLUX (Best Faces)", "Pony Realism (People/Explicit)", "Juggernaut (Nature/Action)"],
-                                    value="FLUX (Best Faces)",
-                                    label="Select Model"
-                                )
-
-                                use_trigger = gr.Checkbox(
-                                    label=f"Add trigger word: '{CONFIG['trigger_word']}'",
-                                    value=False,
-                                )
-
-                                with gr.Row():
-                                    img_width = gr.Slider(512, 1536, value=768, step=64, label="Width")
-                                    img_height = gr.Slider(512, 1536, value=1024, step=64, label="Height")
-
-                                with gr.Row():
-                                    img_steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
-                                    img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
-                                    img_guidance = gr.Slider(1, 12, value=3.5, step=0.5, label="Guidance (FLUX: 3-4, SDXL: 7-8)")
-
-                                generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
-
-                                with gr.Row():
-                                    unload_img_btn = gr.Button("🗑️ Unload Image Models", variant="secondary")
-                                    load_img_btn = gr.Button("📥 Load Image Models", variant="secondary")
-
-                                img_status = gr.Textbox(label="Model Status", value="Models ready", interactive=False)
-
-                                # Preset prompts
-                                gr.HTML("<h4 style='color: white; margin-top: 20px;'>Quick Presets:</h4>")
-
-                                preset_btns = []
-                                presets = [
-                                    ("Professional Portrait", "professional portrait, business attire, office background, confident pose"),
-                                    ("Casual Outdoor", "casual outfit, outdoor park setting, natural lighting, relaxed smile"),
-                                    ("Elegant Evening", "elegant black dress, evening setting, sophisticated pose"),
-                                    ("Athletic", "athletic wear, gym setting, energetic pose"),
-                                    ("Cozy Home", "cozy sweater, living room, warm lighting, relaxed"),
-                                ]
-
-                                for name, prompt in presets:
-                                    btn = gr.Button(name, size="sm")
-                                    btn.click(lambda p=prompt: p, outputs=img_prompt)
-
-                            with gr.Column(scale=1):
-                                output_image = gr.Image(label="Generated Image", height=512)
-                                output_info = gr.Textbox(label="Info", interactive=False)
-
-                    # ===== IMAGE TO IMAGE SUB-TAB =====
-                    with gr.TabItem("🖼️ Image to Image"):
-                        gr.HTML("""
-                        <div style="padding: 10px; background: rgba(100,200,100,0.1); border-radius: 8px; margin-bottom: 15px;">
-                            <p style="color: #aaffaa; margin: 0;"><b>💡 Workflow:</b> Generate face with FLUX → Upload here → Transform with Pony/Juggernaut</p>
-                        </div>
-                        """)
+                            img_width = gr.Slider(512, 1536, value=768, step=64, label="Width")
+                            img_height = gr.Slider(512, 1536, value=1024, step=64, label="Height")
 
                         with gr.Row():
-                            with gr.Column(scale=1):
-                                img2img_input = gr.Image(label="Upload Image (from FLUX or any source)", type="pil", height=300)
+                            img_steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
+                            img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                            img_guidance = gr.Slider(5, 12, value=8.0, step=0.5, label="Guidance")
 
-                                img2img_prompt = gr.Textbox(
-                                    label="Prompt (describe modifications)",
-                                    placeholder="sexy lingerie, bedroom setting, seductive pose...",
-                                    lines=3,
-                                )
+                        generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
 
-                                img2img_negative = gr.Textbox(
-                                    label="Negative Prompt",
-                                    value="blurry, bad anatomy, deformed, ugly, watermark",
-                                    lines=2,
-                                )
+                        with gr.Row():
+                            unload_img_btn = gr.Button("🗑️ Unload Image Models", variant="secondary")
+                            load_img_btn = gr.Button("📥 Load Image Models", variant="secondary")
+                        
+                        img_status = gr.Textbox(label="Model Status", value="Models loaded", interactive=False)
 
-                                img2img_model = gr.Radio(
-                                    choices=["Pony Realism (Explicit)", "Juggernaut (Nature/Action)"],
-                                    value="Pony Realism (Explicit)",
-                                    label="Select Model"
-                                )
+                        # Preset prompts
+                        gr.HTML("<h4 style='color: white; margin-top: 20px;'>Quick Presets:</h4>")
 
-                                img2img_strength = gr.Slider(0.1, 1.0, value=0.5, step=0.05,
-                                    label="Strength (0.3=keep face, 0.5=balanced, 0.8=major changes)")
+                        preset_btns = []
+                        presets = [
+                            ("Professional Portrait", "professional portrait, business attire, office background, confident pose"),
+                            ("Casual Outdoor", "casual outfit, outdoor park setting, natural lighting, relaxed smile"),
+                            ("Elegant Evening", "elegant black dress, evening setting, sophisticated pose"),
+                            ("Athletic", "athletic wear, gym setting, energetic pose"),
+                            ("Cozy Home", "cozy sweater, living room, warm lighting, relaxed"),
+                        ]
 
-                                with gr.Row():
-                                    img2img_steps = gr.Slider(10, 50, value=30, step=1, label="Steps")
-                                    img2img_guidance = gr.Slider(1, 12, value=7.0, step=0.5, label="Guidance")
-                                    img2img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                        for name, prompt in presets:
+                            btn = gr.Button(name, size="sm")
+                            btn.click(lambda p=prompt: p, outputs=img_prompt)
 
-                                img2img_btn = gr.Button("🔄 Transform Image", variant="primary", size="lg")
+                    with gr.Column(scale=1):
+                        output_image = gr.Image(label="Generated Image", height=512)
+                        output_info = gr.Textbox(label="Info", interactive=False)
 
-                            with gr.Column(scale=1):
-                                img2img_output = gr.Image(label="Transformed Image", height=512)
-                                img2img_info = gr.Textbox(label="Info", interactive=False)
-
-                        gr.HTML("""
-                        <div style="margin-top: 15px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 8px;">
-                            <h4 style="color: white; margin: 0 0 10px 0;">💡 Strength Guide:</h4>
-                            <ul style="color: #aaa; margin: 0; padding-left: 20px;">
-                                <li><b>0.3-0.4:</b> Keep face, change lighting/style</li>
-                                <li><b>0.5-0.6:</b> Modify outfit/pose while keeping likeness</li>
-                                <li><b>0.7-0.8:</b> Major changes, face may drift</li>
-                            </ul>
-                        </div>
-                        """)
-
-                # Gallery of recent generations (outside sub-tabs)
+                # Gallery of recent generations
                 gr.HTML("<h4 style='color: white; margin-top: 20px;'>Recent Generations:</h4>")
                 gallery = gr.Gallery(label="Gallery", columns=4, height=200)
 
@@ -5647,12 +5600,12 @@ def create_dashboard():
                             )
                             with gr.Row():
                                 load_model_btn = gr.Button("🚀 Load Local Model", variant="primary")
-                                unload_model_btn = gr.Button("🗑️ Unload Model", variant="stop")
-                            refresh_status_btn = gr.Button("🔄 Refresh Status", variant="secondary", size="sm")
-                            model_status = gr.Textbox(label="Status", value=get_model_status(), interactive=False)
+                                unload_model_btn = gr.Button("🛑 Unload & Free Memory", variant="secondary")
+                            model_status = gr.Textbox(label="Status", value="No model loaded", interactive=False)
                         else:
                             model_selector = None
                             load_model_btn = None
+                            unload_model_btn = None
                             model_status = None
 
                         lora_path = gr.Textbox(
@@ -5762,6 +5715,8 @@ def create_dashboard():
             # Update cloud mode based on UI selection
             _use_gemini = (model_choice == "Gemini") and GEMINI_AVAILABLE
             _use_elevenlabs = (voice_choice == "ElevenLabs") and ELEVENLABS_AVAILABLE
+            logger.warning(f"[PROCESS_CHAT] model_choice='{model_choice}', setting _use_gemini={_use_gemini}")
+            print(f"[PROCESS_CHAT] model_choice='{model_choice}', _use_gemini={_use_gemini}", flush=True)
             print(f"[CLOUD DEBUG] model_choice={model_choice}, voice_choice={voice_choice}", flush=True)
             print(f"[CLOUD DEBUG] _use_gemini={_use_gemini}, _use_elevenlabs={_use_elevenlabs}, GEMINI_AVAILABLE={GEMINI_AVAILABLE}", flush=True)
             logger.info(f"[CLOUD] Model: {model_choice} -> _use_gemini={_use_gemini}, Voice: {voice_choice} -> _use_elevenlabs={_use_elevenlabs}")
@@ -5861,6 +5816,8 @@ def create_dashboard():
             global _use_gemini
             _use_gemini = (model_choice == "Gemini") and GEMINI_AVAILABLE
             status = f"Model: {'Gemini ✅' if _use_gemini else 'Local ✅'}"
+            logger.warning(f"[MODEL SELECT] model_choice='{model_choice}', _use_gemini={_use_gemini}, GEMINI_AVAILABLE={GEMINI_AVAILABLE}")
+            print(f"[MODEL SELECT] model_choice='{model_choice}', _use_gemini={_use_gemini}", flush=True)
             logger.info(f"[CLOUD] {status}")
             return f"*{status}*"
 
@@ -6010,15 +5967,86 @@ def create_dashboard():
                 outputs=[model_status]
             )
 
-            # Refresh status button handler
-            refresh_status_btn.click(
-                lambda: get_model_status(),
-                outputs=[model_status]
-            )
+            def do_unload_model():
+                """Stop all models (Ollama, Vision, FLUX) and free GPU memory"""
+                import subprocess
+                import gc
+                import torch
+                import requests
 
-            # Unload model button handler
+                unloaded = []
+
+                # 1. Stop Ollama models via API
+                try:
+                    # First get list of running models
+                    ollama_url = CONFIG.get("ollama_url", "http://localhost:11434")
+                    ps_response = requests.get(f"{ollama_url}/api/ps", timeout=5)
+                    if ps_response.status_code == 200:
+                        running = ps_response.json().get('models', [])
+                        for model_info in running:
+                            model_name = model_info.get('name', '')
+                            if model_name:
+                                # Send empty generate request with keep_alive=0 to unload
+                                try:
+                                    requests.post(
+                                        f"{ollama_url}/api/generate",
+                                        json={"model": model_name, "keep_alive": 0},
+                                        timeout=30
+                                    )
+                                    unloaded.append(f"Ollama:{model_name}")
+                                except Exception as e:
+                                    logger.warning(f"Could not unload {model_name}: {e}")
+                except requests.exceptions.ConnectionError:
+                    logger.info("Ollama not running or not accessible")
+                except Exception as e:
+                    logger.warning(f"Ollama unload error: {e}")
+
+                # 2. Unload Vision model
+                try:
+                    result = unload_vision_model()
+                    if "unloaded" in result.lower() or "freed" in result.lower():
+                        unloaded.append("Vision Model")
+                except Exception as e:
+                    logger.warning(f"Vision unload error: {e}")
+
+                # 3. Unload FLUX pipeline
+                try:
+                    if state.flux_pipeline is not None:
+                        del state.flux_pipeline
+                        state.flux_pipeline = None
+                        unloaded.append("FLUX Pipeline")
+                except Exception as e:
+                    logger.warning(f"FLUX unload error: {e}")
+
+                # 4. Force garbage collection and clear CUDA cache
+                try:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                except Exception as e:
+                    logger.warning(f"CUDA cleanup error: {e}")
+
+                # Get GPU memory status after unload
+                try:
+                    gpu_result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
+                                               capture_output=True, text=True, timeout=10)
+                    if gpu_result.returncode == 0:
+                        mem_used, mem_total = gpu_result.stdout.strip().split(',')
+                        mem_info = f"\n💾 GPU Memory: {float(mem_used)/1024:.1f}GB / {float(mem_total)/1024:.1f}GB free"
+                    else:
+                        mem_info = ""
+                except:
+                    mem_info = ""
+
+                if unloaded:
+                    return f"✅ Unloaded: {', '.join(unloaded)}{mem_info}"
+                else:
+                    return f"No models were loaded{mem_info}"
+
             unload_model_btn.click(
-                lambda: unload_model(),
+                do_unload_model,
+                inputs=[],
                 outputs=[model_status]
             )
 
@@ -6150,10 +6178,11 @@ def create_dashboard():
         # Image generation handler
         generate_btn.click(
             generate_image,
-            inputs=[img_prompt, img_negative, model_select, use_trigger, img_width, img_height, img_steps, img_seed, img_guidance],
+            inputs=[img_prompt, img_negative, model_select, use_trigger, img_width, img_height, img_steps, img_guidance, img_seed],
             outputs=[output_image, output_info]
         )
 
+        # Image model unload/load handlers
         unload_img_btn.click(
             unload_image_models,
             outputs=[img_status]
@@ -6162,13 +6191,6 @@ def create_dashboard():
         load_img_btn.click(
             load_image_models,
             outputs=[img_status]
-        )
-
-        # Image to Image handler
-        img2img_btn.click(
-            generate_img2img,
-            inputs=[img2img_input, img2img_prompt, img2img_negative, img2img_model, img2img_strength, img2img_steps, img2img_guidance, img2img_seed],
-            outputs=[img2img_output, img2img_info]
         )
 
         # Capture from server camera handler
@@ -6522,24 +6544,12 @@ def create_dashboard():
                     pass
 
                 try:
-                    # Find latest checkpoint
-                    ckpt_dir = "/workspace/host/ai-clone-training/my-output/alexandra-qwen72b-lora"
-                    latest_ckpt = None
-                    if os.path.exists(ckpt_dir):
-                        ckpts = [d for d in os.listdir(ckpt_dir) if d.startswith("checkpoint-")]
-                        if ckpts:
-                            latest_ckpt = os.path.join(ckpt_dir, max(ckpts, key=lambda x: int(x.split('-')[1])))
-
-                    cmd = ["python3", "/workspace/host/ai-clone-training/train_domain.py", "coding"]
-                    if latest_ckpt:
-                        cmd.extend(["--resume", latest_ckpt])
-
                     proc = subprocess.Popen(
-                        cmd,
+                        ["python3", "/workspace/train_ultimate_fast.py"],
                         stdout=open("/tmp/training_output.log", "w"),
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
-                        cwd="/workspace/host/ai-clone-training"
+                        cwd="/workspace"
                     )
                     training_process["pid"] = proc.pid
                     training_process["running"] = True
@@ -6556,7 +6566,7 @@ def create_dashboard():
 
             try:
                 # Kill both types of training processes
-                subprocess.run(["pkill", "-f", "train_domain.py"], capture_output=True, text=True, timeout=10)
+                subprocess.run(["pkill", "-f", "train_ultimate_fast.py"], capture_output=True, text=True, timeout=10)
                 subprocess.run(["pkill", "-f", "train_voice.py"], capture_output=True, text=True, timeout=10)
 
                 train_type = training_process.get("type", "unknown")
@@ -6572,13 +6582,32 @@ def create_dashboard():
         def get_training_log():
             """Get the last 20 lines of training output"""
             import subprocess
+            import os
             try:
+                # Check for SDXL LoRA training log first (image training)
+                lora_log = "/tmp/lora_training.log"
+                voice_log = "/tmp/training_output.log"
+
+                # Use whichever log is more recent
+                logs_to_check = []
+                if os.path.exists(lora_log):
+                    logs_to_check.append((lora_log, os.path.getmtime(lora_log), "🎨 Image LoRA"))
+                if os.path.exists(voice_log):
+                    logs_to_check.append((voice_log, os.path.getmtime(voice_log), "🎤 Voice"))
+
+                if not logs_to_check:
+                    return "No training log available yet..."
+
+                # Sort by modification time, most recent first
+                logs_to_check.sort(key=lambda x: x[1], reverse=True)
+                log_file, _, label = logs_to_check[0]
+
                 result = subprocess.run(
-                    ["tail", "-20", "/tmp/training_output.log"],
+                    ["tail", "-20", log_file],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.stdout.strip():
-                    return result.stdout
+                    return f"{label} Training:\n{result.stdout}"
                 return "No training log available yet..."
             except Exception as e:
                 return f"Could not read log: {e}"
@@ -6586,16 +6615,33 @@ def create_dashboard():
         def check_training_running():
             """Check if training is currently running"""
             import subprocess
+            import json
             try:
-                # Check for LoRA training
+                # Check for SDXL Image LoRA training first
                 result = subprocess.run(
-                    ["pgrep", "-f", "train_domain.py"],
+                    ["pgrep", "-f", "train_sdxl_lora.py"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.stdout.strip():
+                    training_process["running"] = True
+                    training_process["type"] = "image_lora"
+                    # Try to get progress from status file
+                    try:
+                        with open("/tmp/lora_training_status.json") as f:
+                            status = json.load(f)
+                        return f"🟢 Image LoRA Training (PID: {result.stdout.strip().split()[0]})\n🎨 Step {status['step']}/{status['total']} ({status['progress']}%)\n📉 Loss: {status['loss']:.4f}"
+                    except:
+                        return f"🟢 Image LoRA Training in progress (PID: {result.stdout.strip()})"
+
+                # Check for Code LoRA training
+                result = subprocess.run(
+                    ["pgrep", "-f", "train_ultimate_fast.py"],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.stdout.strip():
                     training_process["running"] = True
                     training_process["type"] = "lora"
-                    return f"🟢 LoRA Training in progress (PID: {result.stdout.strip()})"
+                    return f"🟢 Code LoRA Training in progress (PID: {result.stdout.strip()})"
 
                 # Check for Voice training
                 result = subprocess.run(
@@ -6710,7 +6756,7 @@ def create_dashboard():
 
             # First check if anything is currently running
             try:
-                lora_running = subprocess.run(["pgrep", "-f", "train_domain.py"],
+                lora_running = subprocess.run(["pgrep", "-f", "train_ultimate_fast.py"],
                     capture_output=True, text=True, timeout=5).stdout.strip()
                 voice_running = subprocess.run(["pgrep", "-f", "train_voice.py"],
                     capture_output=True, text=True, timeout=5).stdout.strip()
@@ -6964,8 +7010,31 @@ def create_dashboard():
 # MAIN
 # ============================================================================
 
+def cleanup_stale_processes():
+    """Clean up stale Gradio tunnel processes from previous runs"""
+    import subprocess
+    try:
+        # Kill any stale frpc (Gradio tunnel) processes
+        result = subprocess.run(['pkill', '-9', '-f', 'frpc'], capture_output=True)
+        # Also kill any old jarvis_dashboard processes (except current)
+        current_pid = os.getpid()
+        result = subprocess.run(['pgrep', '-f', 'jarvis_dashboard'], capture_output=True, text=True)
+        if result.returncode == 0:
+            for pid in result.stdout.strip().split('\n'):
+                if pid and int(pid) != current_pid:
+                    try:
+                        subprocess.run(['kill', '-9', pid], capture_output=True)
+                    except:
+                        pass
+        print("[CLEANUP] Cleared stale processes from previous runs")
+    except Exception as e:
+        print(f"[CLEANUP] Warning: {e}")
+
 def main():
     """Launch the dashboard"""
+    # Clean up stale processes before starting
+    cleanup_stale_processes()
+
     print("""
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
@@ -6981,21 +7050,6 @@ def main():
 ╚══════════════════════════════════════════════════════════════════╝
     """)
 
-    # Auto-load the Vision-Language model on startup
-    if LOCAL_MODEL_AVAILABLE:
-        print("[JARVIS] Auto-loading Qwen2.5-VL-72B vision model...")
-        try:
-            # Prefer VL model for vision+chat, fall back to first available
-            vl_model = "Qwen2.5-VL-72B (Vision+Chat)"
-            if vl_model in AVAILABLE_MODELS:
-                result = load_model(vl_model)
-                print(f"[JARVIS] {result}")
-            elif AVAILABLE_MODELS:
-                result = load_model(DEFAULT_MODEL)
-                print(f"[JARVIS] {result}")
-        except Exception as e:
-            print(f"[JARVIS] Auto-load failed: {e}")
-
     dashboard = create_dashboard()
 
     import os
@@ -7004,17 +7058,22 @@ def main():
     use_share = os.environ.get('JARVIS_SHARE', 'true').lower() == 'true'
     print(f"[JARVIS] Starting with share={use_share}")
 
-    # Enable queue for concurrent request handling (prevents UI hang during long TTS)
-    dashboard.queue(
-        max_size=20,
-        default_concurrency_limit=2
-    )
+    # Enable queue with longer timeout for image generation
+    dashboard.queue()
+    
     dashboard.launch(
         server_name="0.0.0.0",
         server_port=port,
         share=use_share,
         show_error=True,
+        prevent_thread_lock=True,
     )
+    
+    # Keep running
+    import time
+    while True:
+        time.sleep(1)
+    
 
 
 if __name__ == "__main__":
