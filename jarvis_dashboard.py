@@ -4327,8 +4327,25 @@ def create_dashboard():
         const st = document.getElementById('mic-status');
         const name = sel ? sel.options[sel.selectedIndex].text : id;
         if(st) st.innerHTML = 'Using: <b>'+name+'</b>';
-        console.log('[MIC] Using:', name);
+        console.log('[MIC] Switched to:', name, 'ID:', id);
     };
+
+    // Override getUserMedia to use selected microphone (fixes AirPods issue)
+    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = function(constraints) {
+        if (constraints && constraints.audio && window.selectedMicId) {
+            // Force the selected device
+            if (typeof constraints.audio === 'boolean') {
+                constraints.audio = { deviceId: { exact: window.selectedMicId } };
+            } else if (typeof constraints.audio === 'object') {
+                constraints.audio.deviceId = { exact: window.selectedMicId };
+            }
+            console.log('[MIC] Forcing device:', window.selectedMicId);
+        }
+        return originalGetUserMedia(constraints);
+    };
+    console.log('[MIC] getUserMedia override installed - mic selector now works!');
+
     setTimeout(function(){if(window.refreshMicList)window.refreshMicList();}, 2000);
     """
 
