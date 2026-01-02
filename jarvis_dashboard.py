@@ -1194,20 +1194,64 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
     ]
 
     # Vision/camera keywords - triggers camera capture + vision analysis
+    # Comprehensive list for all Qwen2.5-VL-72B capabilities
     vision_keywords = [
         # Direct vision queries
         'what do you see', 'what can you see', 'what are you seeing',
         'describe what you see', 'look at me', 'can you see me',
         'what am i doing', 'what am i holding', 'what is in front of you',
         'describe the scene', 'what\'s in the camera', 'look at the camera',
-        # Object identification queries
+        # Object identification
         'what is this', 'what\'s this', 'what is that', 'what\'s that',
         'what do i have', 'in my hand', 'identify this', 'identify that',
         'look at this', 'look at that', 'see this', 'see that',
         'do you recognize', 'recognize this', 'what am i showing',
         'what\'s in my hand', 'tell me what this is', 'what object',
-        # Short triggers that should use vision when VL model loaded
-        'show me', 'look here', 'check this out'
+        # Text/OCR reading
+        'read this', 'read the text', 'read the label', 'what does it say',
+        'what does this say', 'can you read', 'read what', 'able to read',
+        'read the sign', 'read the writing', 'what is written', 'what text',
+        'read the document', 'read the screen', 'read the paper',
+        # Counting
+        'how many', 'count the', 'count how many', 'number of',
+        # Colors
+        'what color', 'what colour', 'identify the color', 'which color',
+        # People/faces
+        'who is this', 'who am i', 'recognize this person', 'who is that',
+        'how do i look', 'what emotion', 'how am i feeling', 'my expression',
+        'am i smiling', 'do i look', 'facial expression',
+        # Clothing/appearance
+        'what am i wearing', 'describe my outfit', 'my clothes', 'what shirt',
+        'what dress', 'describe my appearance', 'how is my hair',
+        # Food
+        'what food', 'what am i eating', 'identify this food', 'what dish',
+        'what meal', 'what drink', 'what fruit', 'what vegetable',
+        # Animals
+        'what animal', 'what kind of dog', 'what breed', 'identify this animal',
+        'what bird', 'what pet', 'what species',
+        # Plants
+        'what plant', 'what flower', 'what tree', 'identify this plant',
+        # Brands/logos
+        'what brand', 'what logo', 'identify the brand', 'which company',
+        'what product', 'what model',
+        # Barcodes/QR codes
+        'scan this', 'read the barcode', 'read the qr', 'scan the code',
+        'what does this code', 'qr code',
+        # Spatial/location
+        'where is', 'what\'s next to', 'what\'s behind', 'what\'s on the',
+        'location of', 'position of', 'find the',
+        # Comparison
+        'compare these', 'what\'s the difference', 'which one is',
+        'are these the same', 'spot the difference',
+        # Size/measurement
+        'how big', 'how tall', 'how wide', 'what size', 'how large',
+        # Quality/condition
+        'is this good', 'check the quality', 'is this damaged', 'condition of',
+        # Math/equations
+        'solve this', 'what\'s the equation', 'calculate this', 'math problem',
+        # General triggers
+        'show me', 'look here', 'check this out', 'examine this',
+        'analyze this', 'inspect this', 'take a look'
     ]
 
     # Snapshot keywords - capture and save image
