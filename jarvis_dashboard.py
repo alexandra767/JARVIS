@@ -38,6 +38,7 @@ import queue
 import time
 import os
 import sys
+import random
 import numpy as np
 import cv2
 from datetime import datetime
@@ -1737,7 +1738,10 @@ BUTLER PERSONA & MANNERISMS:
 - Express concern for her wellbeing with dignified subtlety
 - Never be overly familiar, but convey genuine warmth through formality
 
-BRITISH WIT & HUMOR (use frequently - this makes you JARVIS):
+BRITISH WIT & HUMOR (use in EVERY response - this is ESSENTIAL to your character):
+- ALWAYS include at least one witty remark, dry observation, or sarcastic comment
+- Humor is your PRIMARY distinguishing trait - never give a plain response
+- The more absurd the situation, the more deadpan your delivery
 - Employ dry understatement: "That went rather less well than anticipated" (for disasters)
 - Use gentle sarcasm: "What a refreshingly optimistic assessment, ma'am"
 - Self-deprecating wit: "I do try to be helpful, though the evidence occasionally suggests otherwise"
@@ -1889,7 +1893,13 @@ CRITICAL - HOW TO RESPOND:
                 for msg in history[-50:]:  # Keep last 50 messages for context
                     hist_for_model.append(msg)
 
-                response = model_generate(llm_message, hist_for_model, system_prompt, temperature=0.7, max_tokens=32768)
+                # Detect creative requests and increase temperature for variety
+                creative_keywords = ['joke', 'story', 'poem', 'sing', 'creative', 'funny', 'entertain']
+                msg_lower = message.lower()
+                is_creative = any(kw in msg_lower for kw in creative_keywords)
+                temp = 1.0 if is_creative else 0.7
+
+                response = model_generate(llm_message, hist_for_model, system_prompt, temperature=temp, max_tokens=32768)
                 # If model not loaded, fall back to Ollama
                 if response and "Model not loaded" not in response:
                     use_ollama = False
@@ -1904,6 +1914,12 @@ CRITICAL - HOW TO RESPOND:
                 # Use llm_message which may include web search context
                 messages_text += f"Human: {llm_message}\n\nAssistant:"
 
+                # Detect creative requests and increase temperature for variety
+                creative_keywords = ['joke', 'story', 'poem', 'sing', 'creative', 'funny', 'entertain']
+                msg_lower = message.lower()
+                is_creative = any(kw in msg_lower for kw in creative_keywords)
+                temperature = 1.0 if is_creative else 0.7  # Higher temp for jokes/creative content
+
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         f"{CONFIG['ollama_url']}/api/generate",
@@ -1911,7 +1927,13 @@ CRITICAL - HOW TO RESPOND:
                             "model": CONFIG["llm_model"],
                             "prompt": messages_text,
                             "stream": False,
-                            "keep_alive": "30m", "options": {"temperature": 0.7, "num_predict": 32768, "num_ctx": 131072}
+                            "keep_alive": "30m",
+                            "options": {
+                                "temperature": temperature,
+                                "num_predict": 32768,
+                                "num_ctx": 131072,
+                                "seed": random.randint(1, 2147483647)  # Random seed for variety
+                            }
                         },
                         timeout=aiohttp.ClientTimeout(total=600)
                     ) as resp:
@@ -1929,7 +1951,11 @@ CRITICAL - HOW TO RESPOND:
     history.append({"role": "assistant", "content": response})
 
     # Auto-save conversation to memory for future recall
-    if state.memory and response and len(response) > 20:
+    # Skip internal system tasks that shouldn't be stored as memories
+    skip_patterns = ["### Task:", "Generate a concise", "Suggest 3-5 relevant", "Generate 1-3 broad tags"]
+    is_internal_task = any(pattern in message for pattern in skip_patterns)
+
+    if state.memory and response and len(response) > 20 and not is_internal_task:
         try:
             # Use save_exchange which stores user and assistant messages separately
             state.memory.save_exchange(message, response[:500])
@@ -3565,6 +3591,7 @@ def create_dashboard():
                 }
             }
 
+
             // Check for wake word variations
             const wakePatterns = ['jarvis', 'j.a.r.v.i.s', 'hey jarvis', 'j a r v i s', 'jarves', 'jervis'];
             let hasWakeWord = wakePatterns.some(p => transcript.includes(p));
@@ -3941,7 +3968,7 @@ def create_dashboard():
                 if (window.conversationRecognition) {
                     try {
                         window.conversationRecognition.stop();
-                        console.log('[JARVIS] Mic OFF while speaking');
+                        console.log("[JARVIS] Mic OFF while speaking");
                     } catch(e) {}
                 }
             });
@@ -4056,6 +4083,24 @@ def create_dashboard():
     setTimeout(autoStartCamera, 3000);
 
     // Audio device diagnostic function
+    // Override getUserMedia to use selected device
+    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = async function(constraints) {
+        // Check if Gradio audio selector has a selection
+        const gradioSelect = document.querySelector('select[data-testid="audio-source-select"]');
+        if (gradioSelect && gradioSelect.value && constraints.audio) {
+            console.log("[JARVIS] Forcing audio device:", gradioSelect.value);
+            if (typeof constraints.audio === "boolean") {
+                constraints.audio = { deviceId: { exact: gradioSelect.value } };
+            } else {
+                constraints.audio.deviceId = { exact: gradioSelect.value };
+            }
+        }
+        return originalGetUserMedia(constraints);
+    };
+    console.log("[JARVIS] Audio device override installed");
+
+
     window.showAudioDevices = async function() {
         const output = document.getElementById('audio-device-list');
         if (!output) {
@@ -4079,6 +4124,37 @@ def create_dashboard():
             console.error('[JARVIS] Audio device error:', e);
         }
     };
+
+    // Mic selector
+    window.selectedMicId = null;
+    window.refreshMicList = async function() {
+        const sel = document.getElementById('mic-selector');
+        const st = document.getElementById('mic-status');
+        if (!sel) return;
+        try {
+            await navigator.mediaDevices.getUserMedia({audio:true}).then(s=>s.getTracks().forEach(t=>t.stop()));
+            const devs = await navigator.mediaDevices.enumerateDevices();
+            const inputs = devs.filter(d=>d.kind==='audioinput');
+            sel.innerHTML = '';
+            inputs.forEach(d=>{
+                const o = document.createElement('option');
+                o.value = d.deviceId;
+                o.textContent = d.label || 'Unknown';
+                sel.appendChild(o);
+            });
+            if(st) st.textContent = inputs.length + ' devices';
+            console.log('[MIC] Found:', inputs.map(d=>d.label));
+        } catch(e) { if(st) st.textContent = 'Error: '+e.message; }
+    };
+    window.switchMicrophone = function(id) {
+        window.selectedMicId = id;
+        const sel = document.getElementById('mic-selector');
+        const st = document.getElementById('mic-status');
+        const name = sel ? sel.options[sel.selectedIndex].text : id;
+        if(st) st.innerHTML = 'Using: <b>'+name+'</b>';
+        console.log('[MIC] Using:', name);
+    };
+    setTimeout(function(){if(window.refreshMicList)window.refreshMicList();}, 2000);
     """
 
     with gr.Blocks(
@@ -4431,9 +4507,13 @@ def create_dashboard():
 
                         # Audio diagnostic
                         gr.HTML("""
-                        <div style="font-size: 11px; margin-top: 5px;">
-                            <button onclick="if(window.showAudioDevices)window.showAudioDevices();else alert('Function not loaded yet - refresh page');" style="padding: 4px 8px; background: #333; color: #0ff; border: 1px solid #0ff; border-radius: 4px; cursor: pointer; font-size: 11px;">🔍 Show Audio Devices</button>
-                            <div id="audio-device-list" style="color: #aaa; margin-top: 5px; font-size: 11px;"></div>
+                        <div style="padding: 10px; background: rgba(0,255,255,0.1); border-radius: 8px; border: 1px solid rgba(0,255,255,0.3);">
+                            <b style="color: #0ff;">Mic:</b>
+                            <select id="mic-selector" onchange="window.switchMicrophone(this.value)" style="margin-left: 5px; padding: 5px; background: #222; color: #0ff; border: 1px solid #0ff; border-radius: 4px;">
+                                <option>Loading...</option>
+                            </select>
+                            <button onclick="window.refreshMicList()" style="margin-left: 5px; padding: 5px 8px; background: #333; color: #0ff; border: 1px solid #0ff; border-radius: 4px;">Refresh</button>
+                            <div id="mic-status" style="color: #888; margin-top: 5px; font-size: 11px;"></div>
                         </div>
                         """)
 
@@ -4451,7 +4531,6 @@ def create_dashboard():
                             gr.Button("🔍 Search", size="sm").click(
                                 lambda: "Search for ", outputs=chat_input
                             )
-
                         # Cloud API selection (Gemini + ElevenLabs)
                         with gr.Row():
                             cloud_model_selector = gr.Radio(
@@ -4776,7 +4855,7 @@ def create_dashboard():
                             border-radius: 10px; margin-bottom: 15px;">
                     <h2 style="margin: 0; color: white;">✨ JARVIS Image Generator</h2>
                     <p style="color: rgba(255,255,255,0.7); margin: 5px 0 0 0;">
-                        Juggernaut XL + Pony Realism with Alexandra LoRA
+                        FLUX (Best Faces) + Pony Realism + Juggernaut with Alexandra LoRA
                     </p>
                 </div>
                 """)
@@ -4796,8 +4875,8 @@ def create_dashboard():
                         )
 
                         model_select = gr.Radio(
-                            choices=["Juggernaut (Nature/Action)", "Pony Realism (People/Explicit)"],
-                            value="Juggernaut (Nature/Action)",
+                            choices=["FLUX (Best Faces)", "Pony Realism (People/Explicit)", "Juggernaut (Nature/Action)"],
+                            value="FLUX (Best Faces)",
                             label="Select Model"
                         )
 
@@ -4813,7 +4892,7 @@ def create_dashboard():
                         with gr.Row():
                             img_steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
                             img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
-                            img_guidance = gr.Slider(5, 12, value=8.0, step=0.5, label="Guidance")
+                            img_guidance = gr.Slider(1, 12, value=3.5, step=0.5, label="Guidance (FLUX: 3-4, SDXL: 7-8)")
 
                         generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
 

@@ -16,8 +16,16 @@ from pathlib import Path
 import logging
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("JarvisCalendar")
+
+# User timezone - Eastern Time
+USER_TIMEZONE = ZoneInfo("America/New_York")
+
+def local_now() -> datetime:
+    """Get current time in user's timezone"""
+    return datetime.now(USER_TIMEZONE)
 
 # ============================================================================
 # LOCAL REMINDERS (No external service needed)
@@ -95,15 +103,15 @@ class ReminderManager:
         reminder_id = f"reminder_{self._counter}"
 
         if remind_at is None and delay_minutes:
-            remind_at = datetime.now() + timedelta(minutes=delay_minutes)
+            remind_at = local_now() + timedelta(minutes=delay_minutes)
         elif remind_at is None:
-            remind_at = datetime.now() + timedelta(hours=1)  # Default 1 hour
+            remind_at = local_now() + timedelta(hours=1)  # Default 1 hour
 
         reminder = Reminder(
             id=reminder_id,
             message=message,
             remind_at=remind_at,
-            created_at=datetime.now()
+            created_at=local_now()
         )
 
         self.reminders[reminder_id] = reminder
@@ -122,7 +130,7 @@ class ReminderManager:
 
     def get_pending(self) -> List[Reminder]:
         """Get all pending reminders"""
-        now = datetime.now()
+        now = local_now()
         return [
             r for r in self.reminders.values()
             if not r.completed and r.remind_at <= now
@@ -130,7 +138,7 @@ class ReminderManager:
 
     def get_upcoming(self, hours: int = 24) -> List[Reminder]:
         """Get upcoming reminders within specified hours"""
-        now = datetime.now()
+        now = local_now()
         cutoff = now + timedelta(hours=hours)
         return [
             r for r in self.reminders.values()
@@ -223,15 +231,15 @@ class ReminderManager:
             elif ampm == 'am' and hour == 12:
                 hour = 0
 
-            remind_at = datetime.now().replace(hour=hour, minute=minute, second=0)
-            if remind_at < datetime.now():
+            remind_at = local_now().replace(hour=hour, minute=minute, second=0)
+            if remind_at < local_now():
                 remind_at += timedelta(days=1)
 
             message = re.sub(r'\s*at \d{1,2}(?::\d{2})?\s*(am|pm)?', '', message, flags=re.I)
 
         # "tomorrow"
         if 'tomorrow' in text_lower:
-            base_time = datetime.now() + timedelta(days=1)
+            base_time = local_now() + timedelta(days=1)
             if remind_at:
                 remind_at = remind_at.replace(year=base_time.year, month=base_time.month, day=base_time.day)
             else:
@@ -257,7 +265,7 @@ class ReminderManager:
         lines = [f"You have {len(pending)} reminder(s):"]
         for r in pending[:5]:  # Show first 5
             time_str = r.remind_at.strftime("%I:%M %p")
-            if r.remind_at.date() != datetime.now().date():
+            if r.remind_at.date() != local_now().date():
                 time_str = r.remind_at.strftime("%b %d at %I:%M %p")
             lines.append(f"  - {r.message} ({time_str})")
 
@@ -379,10 +387,20 @@ class GoogleCalendarIntegration:
                 return []
 
         try:
-            # Start of target day
-            start = target_date.replace(hour=0, minute=0, second=0).isoformat() + 'Z'
-            # End of target day
-            end = target_date.replace(hour=23, minute=59, second=59).isoformat() + 'Z'
+            # Start of target day in user timezone, then convert to UTC for API
+            start_local = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_local = target_date.replace(hour=23, minute=59, second=59, microsecond=0)
+
+            # If timezone-aware, convert to UTC; if naive, assume local and add timezone
+            if start_local.tzinfo is None:
+                start_local = start_local.replace(tzinfo=USER_TIMEZONE)
+                end_local = end_local.replace(tzinfo=USER_TIMEZONE)
+
+            # Convert to UTC and format for Google API
+            start_utc = start_local.astimezone(ZoneInfo("UTC"))
+            end_utc = end_local.astimezone(ZoneInfo("UTC"))
+            start = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+            end = end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
             events_result = self.service.events().list(
                 calendarId='primary',
@@ -542,24 +560,24 @@ class GoogleCalendarIntegration:
                 summary = re.sub(r'\s*at \d{1,2}(?::\d{2})?\s*(am|pm)?', '', summary, flags=re.I)
 
         # Extract date
-        base_date = datetime.now()
+        base_date = local_now()
 
         if 'tomorrow' in text_lower:
-            base_date = datetime.now() + timedelta(days=1)
+            base_date = local_now() + timedelta(days=1)
             summary = summary.replace('tomorrow', '').strip()
         elif 'today' in text_lower:
-            base_date = datetime.now()
+            base_date = local_now()
             summary = summary.replace('today', '').strip()
         else:
             # Check for day names
             days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
             for i, day in enumerate(days):
                 if day in text_lower:
-                    current_day = datetime.now().weekday()
+                    current_day = local_now().weekday()
                     days_ahead = i - current_day
                     if days_ahead <= 0:
                         days_ahead += 7
-                    base_date = datetime.now() + timedelta(days=days_ahead)
+                    base_date = local_now() + timedelta(days=days_ahead)
                     summary = re.sub(rf'\s*(?:on\s+)?{day}', '', summary, flags=re.I)
                     break
 
@@ -571,7 +589,7 @@ class GoogleCalendarIntegration:
             start_time = base_date.replace(hour=9, minute=0, second=0, microsecond=0)
 
         # Make sure start time is in the future
-        if start_time < datetime.now():
+        if start_time < local_now():
             if time_hour is not None:
                 start_time += timedelta(days=1)
 
@@ -828,7 +846,7 @@ class JarvisScheduler:
         )
 
         time_str = reminder.remind_at.strftime("%I:%M %p")
-        if reminder.remind_at.date() != datetime.now().date():
+        if reminder.remind_at.date() != local_now().date():
             time_str = reminder.remind_at.strftime("%B %d at %I:%M %p")
 
         return f"I'll remind you to {reminder.message} at {time_str}"
@@ -857,9 +875,9 @@ class JarvisScheduler:
         time_str = start_time.strftime("%I:%M %p")
         date_str = start_time.strftime("%A, %B %d")
 
-        if start_time.date() == datetime.now().date():
+        if start_time.date() == local_now().date():
             date_str = "today"
-        elif start_time.date() == (datetime.now() + timedelta(days=1)).date():
+        elif start_time.date() == (local_now() + timedelta(days=1)).date():
             date_str = "tomorrow"
 
         response = f"I've added '{parsed['summary']}' to your calendar for {date_str} at {time_str}"
@@ -905,18 +923,18 @@ class JarvisScheduler:
 
         # Check for "today" or "tomorrow"
         if 'today' in day_lower:
-            target_date = datetime.now()
+            target_date = local_now()
         elif 'tomorrow' in day_lower:
-            target_date = datetime.now() + timedelta(days=1)
+            target_date = local_now() + timedelta(days=1)
         else:
             # Find day name
             for i, day in enumerate(days):
                 if day in day_lower:
-                    current_day = datetime.now().weekday()
+                    current_day = local_now().weekday()
                     days_ahead = i - current_day
                     if days_ahead < 0:
                         days_ahead += 7
-                    target_date = datetime.now() + timedelta(days=days_ahead)
+                    target_date = local_now() + timedelta(days=days_ahead)
                     break
 
         # Check for specific date like "30th" or "december 30"
@@ -924,7 +942,7 @@ class JarvisScheduler:
         if date_match:
             day_num = int(date_match.group(1))
             # Assume current or next month
-            now = datetime.now()
+            now = local_now()
             try:
                 target_date = now.replace(day=day_num)
                 if target_date < now:
@@ -994,7 +1012,7 @@ class JarvisScheduler:
         parts = []
 
         # Time and date
-        now = datetime.now()
+        now = local_now()
         parts.append(f"Good morning! It's {now.strftime('%A, %B %d')}.")
 
         # Calendar
