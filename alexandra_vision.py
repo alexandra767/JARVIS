@@ -1,6 +1,6 @@
 """
 Alexandra AI - Vision Module
-Image analysis using Qwen2-VL-7B
+Image analysis using Qwen2.5-VL-72B (local, 4-bit quantized)
 """
 
 import os
@@ -8,41 +8,51 @@ import torch
 from PIL import Image
 import numpy as np
 
+# Model path - local model
+VISION_MODEL_PATH = "/workspace/host/models/Qwen2.5-VL-72B-Instruct"
+
 # Global model state
 vision_model = None
 vision_processor = None
 VISION_AVAILABLE = False
 
 def load_vision_model():
-    """Load Qwen2-VL model for vision analysis"""
+    """Load Qwen2.5-VL-72B model for vision analysis"""
     global vision_model, vision_processor, VISION_AVAILABLE
 
     if vision_model is not None:
         return "Vision model already loaded"
 
-    try:
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+    # Check if model exists
+    if not os.path.exists(VISION_MODEL_PATH):
+        return f"Vision model not found at {VISION_MODEL_PATH}. Download in progress?"
 
-        print("[VISION] Loading Qwen2-VL-7B...")
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
+
+        print("[VISION] Loading Qwen2.5-VL-72B (4-bit quantized)...")
 
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            llm_int8_enable_fp32_cpu_offload=True,
         )
 
-        # Allow using up to 115GB of GPU memory (leaving some buffer)
-        max_memory = {0: "115GB", "cpu": "32GB"}
+        # Allow using up to 115GB of GPU memory
+        max_memory = {0: "115GB", "cpu": "48GB"}
 
-        vision_model = Qwen2VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen2-VL-7B-Instruct",
+        vision_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            VISION_MODEL_PATH,
             quantization_config=bnb_config,
             device_map="auto",
             torch_dtype=torch.bfloat16,
             max_memory=max_memory,
+            trust_remote_code=True,
         )
 
-        vision_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+        vision_processor = AutoProcessor.from_pretrained(VISION_MODEL_PATH)
 
         VISION_AVAILABLE = True
         mem = torch.cuda.memory_allocated() / 1024**3
@@ -155,5 +165,7 @@ def get_vision_status():
     """Get vision system status"""
     if VISION_AVAILABLE and vision_model is not None:
         mem = torch.cuda.memory_allocated() / 1024**3
-        return f"Qwen2-VL Ready - GPU: {mem:.1f}GB"
-    return "Vision not loaded"
+        return f"Qwen2.5-VL-72B Ready - GPU: {mem:.1f}GB"
+    if os.path.exists(VISION_MODEL_PATH):
+        return "Vision model available (not loaded)"
+    return "Vision model not downloaded"

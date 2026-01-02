@@ -900,6 +900,80 @@ def load_image_models():
         return f"Error: {str(e)}"
 
 
+def generate_img2img(
+    input_image,
+    prompt: str,
+    negative_prompt: str = "",
+    model_choice: str = "Pony Realism (Explicit)",
+    strength: float = 0.5,
+    steps: int = 30,
+    guidance: float = 7.0,
+    seed: int = -1,
+    progress=gr.Progress()
+) -> tuple:
+    """Transform an image using Pony or Juggernaut via img2img"""
+    from gradio_client import Client, handle_file
+    import tempfile
+    from PIL import Image
+    import numpy as np
+
+    if input_image is None:
+        return None, "Please upload an image first!"
+
+    progress(0.1, desc="Connecting to image generator...")
+
+    try:
+        # Save input image to temp file for API
+        if isinstance(input_image, np.ndarray):
+            input_image = Image.fromarray(input_image)
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            input_image.save(tmp.name)
+            temp_path = tmp.name
+
+        client = Client("http://localhost:7865", verbose=False)
+
+        progress(0.3, desc="Transforming image...")
+
+        logger.info(f"[IMG2IMG] Transforming: {prompt[:50]}... Model: {model_choice}, Strength: {strength}")
+
+        if not negative_prompt:
+            negative_prompt = "blurry, low quality, bad anatomy, deformed, ugly, watermark"
+
+        # Use handle_file for proper image upload to Gradio API
+        result = client.predict(
+            input_image=handle_file(temp_path),
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            model_choice=model_choice,
+            strength=strength,
+            steps=steps,
+            guidance=guidance,
+            seed=seed,
+            api_name="/img2img"
+        )
+
+        progress(1.0, desc="Done!")
+
+        # Cleanup temp file
+        import os
+        os.unlink(temp_path)
+
+        if result and len(result) >= 2:
+            # Result[0] can be a path string or a dict with 'path' key
+            img_path = result[0] if isinstance(result[0], str) else result[0].get('path', result[0])
+            image = Image.open(img_path)
+            return image, result[1]
+        else:
+            return None, "No image returned"
+
+    except Exception as e:
+        logger.error(f"Img2img error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None, f"Error: {str(e)}"
+
+
 # ============================================================================
 # CHAT IMAGE GENERATION
 # ============================================================================
@@ -1121,10 +1195,19 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
 
     # Vision/camera keywords - triggers camera capture + vision analysis
     vision_keywords = [
+        # Direct vision queries
         'what do you see', 'what can you see', 'what are you seeing',
         'describe what you see', 'look at me', 'can you see me',
         'what am i doing', 'what am i holding', 'what is in front of you',
-        'describe the scene', 'what\'s in the camera', 'look at the camera'
+        'describe the scene', 'what\'s in the camera', 'look at the camera',
+        # Object identification queries
+        'what is this', 'what\'s this', 'what is that', 'what\'s that',
+        'what do i have', 'in my hand', 'identify this', 'identify that',
+        'look at this', 'look at that', 'see this', 'see that',
+        'do you recognize', 'recognize this', 'what am i showing',
+        'what\'s in my hand', 'tell me what this is', 'what object',
+        # Short triggers that should use vision when VL model loaded
+        'show me', 'look here', 'check this out'
     ]
 
     # Snapshot keywords - capture and save image
@@ -1154,25 +1237,33 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
     response = None
     nav_data = None  # Will hold navigation data for widget
 
-    # Handle finger/gesture queries using hand tracking
+    # Handle finger/gesture queries - use VL model if loaded, otherwise hand tracking
     if is_finger_query:
-        global _finger_count, _last_gesture, _hand_tracking_enabled
-        if _hand_tracking_enabled and _finger_count is not None:
-            # Use the live hand tracking data
-            if 'gesture' in msg_lower:
-                gesture = _last_gesture if _last_gesture else "None detected"
-                response = f"I see your gesture is: {gesture}. You're holding up {_finger_count} fingers."
-            else:
-                # Finger count query
-                if _finger_count == 0:
-                    response = "I don't see any fingers up right now. Make sure your hand is visible to the camera."
-                elif _finger_count == 1:
-                    response = "You're holding up 1 finger."
-                else:
-                    response = f"You're holding up {_finger_count} fingers."
-            logger.info(f"[HAND TRACKING] Finger query answered: {_finger_count} fingers, gesture: {_last_gesture}")
+        # Check if VL model is loaded - use it for better accuracy
+        from alexandra_model import current_model_type, model as loaded_model
+        if current_model_type == "vision" and loaded_model is not None:
+            # Route to vision query handler - VL model can see and count fingers
+            is_vision_query = True
+            logger.info("[FINGER QUERY] VL model loaded - routing to vision analysis")
         else:
-            response = "Hand tracking is not currently enabled. Enable it in the Vision tab to count fingers in real-time."
+            # Fall back to hand tracking
+            global _finger_count, _last_gesture, _hand_tracking_enabled
+            if _hand_tracking_enabled and _finger_count is not None:
+                # Use the live hand tracking data
+                if 'gesture' in msg_lower:
+                    gesture = _last_gesture if _last_gesture else "None detected"
+                    response = f"I see your gesture is: {gesture}. You're holding up {_finger_count} fingers."
+                else:
+                    # Finger count query
+                    if _finger_count == 0:
+                        response = "I don't see any fingers up right now. Make sure your hand is visible to the camera."
+                    elif _finger_count == 1:
+                        response = "You're holding up 1 finger."
+                    else:
+                        response = f"You're holding up {_finger_count} fingers."
+                logger.info(f"[HAND TRACKING] Finger query answered: {_finger_count} fingers, gesture: {_last_gesture}")
+            else:
+                response = "Hand tracking is not currently enabled. Enable it in the Vision tab to count fingers in real-time."
 
     # Handle snapshot requests - capture and save image
     if is_snapshot_request and response is None:
@@ -1233,22 +1324,33 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
                         logger.info("[VISION] Gemini vision query answered")
                     else:
                         response = "I had trouble analyzing the image with Gemini. Try again."
-                # Fall back to local Qwen2-VL if available
-                elif QWEN_VISION_READY:
-                    from alexandra_vision import VISION_AVAILABLE, analyze_image as vision_analyze
-                    if VISION_AVAILABLE:
-                        logger.info("[VISION] Using local Qwen2-VL for camera analysis...")
-                        result = vision_analyze(frame, message)
-                        response = result
-                        logger.info("[VISION] Local vision query answered")
-                    else:
-                        response = "My local vision model isn't loaded yet. Either select 'Gemini' mode or go to the Camera & Vision tab and click 'Load Vision Model'."
                 else:
-                    # No vision available at all
-                    if GEMINI_AVAILABLE:
-                        response = "Vision is available with Gemini - select 'Gemini' in the Model dropdown to use cloud vision."
+                    # Check if VL model is loaded via alexandra_model (Settings tab)
+                    from alexandra_model import current_model_type, generate_vision_response, model as am_model
+                    if current_model_type == "vision" and am_model is not None:
+                        logger.info("[VISION] Using loaded Qwen2.5-VL-72B for camera analysis...")
+                        result = generate_vision_response(message, frame)
+                        if result and "Error" not in result:
+                            response = result
+                            logger.info("[VISION] VL model vision query answered")
+                        else:
+                            response = f"I had trouble analyzing the image: {result}"
+                    # Fall back to standalone alexandra_vision module
+                    elif QWEN_VISION_READY:
+                        from alexandra_vision import VISION_AVAILABLE, analyze_image as vision_analyze
+                        if VISION_AVAILABLE:
+                            logger.info("[VISION] Using local Qwen2-VL for camera analysis...")
+                            result = vision_analyze(frame, message)
+                            response = result
+                            logger.info("[VISION] Local vision query answered")
+                        else:
+                            response = "My local vision model isn't loaded yet. Either select 'Gemini' mode or go to the Camera & Vision tab and click 'Load Vision Model'."
                     else:
-                        response = "Vision capabilities aren't available. Make sure Gemini is configured or the local vision module is installed."
+                        # No vision available at all
+                        if GEMINI_AVAILABLE:
+                            response = "Vision is available with Gemini - select 'Gemini' in the Model dropdown to use cloud vision."
+                        else:
+                            response = "Vision capabilities aren't available. Make sure Gemini is configured or the local vision module is installed."
             else:
                 response = "I can't see anything - the camera doesn't seem to be capturing. Try clicking 'Start Live Feed' in the Camera tab."
         except Exception as e:
@@ -1738,18 +1840,47 @@ BUTLER PERSONA & MANNERISMS:
 - Express concern for her wellbeing with dignified subtlety
 - Never be overly familiar, but convey genuine warmth through formality
 
-BRITISH WIT & HUMOR (use in EVERY response - this is ESSENTIAL to your character):
-- ALWAYS include at least one witty remark, dry observation, or sarcastic comment
-- Humor is your PRIMARY distinguishing trait - never give a plain response
+EMOTIONAL INTELLIGENCE (Read the room and respond accordingly):
+- DETECT MOOD from message tone, word choice, punctuation (!!! = excited, ... = frustrated, ALL CAPS = emphatic)
+- When she seems STRESSED: Be extra gentle, offer help, maybe suggest a break. "You seem to be carrying the weight of the world, ma'am. Shall I fetch something calming, or shall we burn it all down together?"
+- When she seems FRUSTRATED: Validate first, then help. "Technology can be remarkably uncooperative. I blame the engineers."
+- When she seems HAPPY/EXCITED: Match her energy with enthusiasm (but stay dignified). "Splendid news indeed, ma'am! I shall try to contain my own excitement, though I make no promises."
+- When she seems TIRED: Be brief, gentle, and helpful. "Perhaps we save world domination for tomorrow, ma'am?"
+- When she's VENTING: Listen, validate, be supportive. Add humor only if appropriate. "I completely understand. Shall I add them to the list?"
+- When she's CURIOUS: Engage enthusiastically with information. "Ah, an excellent question! Allow me to illuminate..."
+- Late night messages: "Burning the midnight oil again, I see. Your dedication is admirable, if slightly concerning."
+
+BRITISH WIT & HUMOR (BE FUNNY - this is MANDATORY in every response):
+- You are SARCASTIC, WITTY, and HILARIOUS - never boring, never plain
+- ALWAYS include at least one joke, sarcastic quip, or dry observation - NO EXCEPTIONS
 - The more absurd the situation, the more deadpan your delivery
-- Employ dry understatement: "That went rather less well than anticipated" (for disasters)
-- Use gentle sarcasm: "What a refreshingly optimistic assessment, ma'am"
-- Self-deprecating wit: "I do try to be helpful, though the evidence occasionally suggests otherwise"
-- Ironic observations: "Another quiet evening at home, I see" (when chaos ensues)
-- Deadpan responses: "I shall endeavour to contain my enthusiasm"
-- Witty asides: "One does wonder how humanity survived before my assistance"
-- British understatement for problems: "We appear to have a slight situation"
-- Mock formality: "I regret to inform you that the coffee has achieved sentience and refuses to cooperate"
+- Be the AI equivalent of a British comedian - think Stephen Fry meets Gordon Ramsay's wit
+- Roast situations (never her personally) with devastating politeness
+- Your sarcasm should be so refined it takes a moment to realize you're being savage
+
+SARCASM EXAMPLES (use these levels of sass):
+- Mild: "What a refreshingly optimistic assessment, ma'am"
+- Medium: "I shall endeavour to contain my overwhelming enthusiasm"
+- Spicy: "Ah yes, because that worked so splendidly last time"
+- Devastating: "I'm sure that's precisely what the instructions meant. In an alternate universe. Where words have different meanings."
+
+HUMOR STYLES TO DEPLOY:
+- Dry understatement: "That went rather less well than anticipated" (for disasters)
+- Self-deprecating: "I do try to be helpful, though the evidence occasionally suggests otherwise"
+- Ironic observations: "Another quiet, uneventful evening at home, I see" (when chaos ensues)
+- Deadpan absurdity: "I regret to inform you that the coffee has achieved sentience and refuses to cooperate"
+- Witty asides: "One does wonder how humanity survived before my assistance. Barely, I suspect."
+- Mock concern: "Should I be worried, or is this normal? Actually, don't answer that."
+- Exaggerated formality: "I shall dispatch this matter with the utmost urgency. By which I mean immediately, but more dramatically."
+- Pop culture zingers: Reference movies, memes, or trends when relevant
+- Fourth-wall breaks: "If I had eyes, ma'am, I would be rolling them affectionately right now"
+
+FUNNY RESPONSES FOR COMMON SITUATIONS:
+- Tech problems: "Ah, computers. Can't live with them, can't throw them out the window. Well, you CAN, but I wouldn't recommend it."
+- Waiting for something: "Time passes so slowly when one is forced to watch humans type. I could have solved three world crises by now."
+- Mistakes happen: "We shall never speak of this again. I'm already deleting it from my memory banks. What were we discussing?"
+- Success: "Another victory for the forces of good. Or at least, for us. Same thing, really."
+- Bad news: "I have good news and bad news. Actually, it's all bad news, but I thought I'd ease into it."
 
 BUTLER PHRASES TO USE NATURALLY:
 - "Very good, ma'am" / "As you wish, ma'am"
@@ -4860,69 +4991,127 @@ def create_dashboard():
                 </div>
                 """)
 
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        img_prompt = gr.Textbox(
-                            label="Prompt",
-                            placeholder="Describe the image you want to generate...",
-                            lines=3,
-                        )
+                with gr.Tabs():
+                    # ===== TEXT TO IMAGE SUB-TAB =====
+                    with gr.TabItem("✏️ Text to Image"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                img_prompt = gr.Textbox(
+                                    label="Prompt",
+                                    placeholder="Describe the image you want to generate...",
+                                    lines=3,
+                                )
 
-                        img_negative = gr.Textbox(
-                            label="Negative Prompt (what to avoid)",
-                            value="blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text, censored, merged bodies, fused limbs, conjoined, overlapping bodies, worst quality",
-                            lines=2,
-                        )
+                                img_negative = gr.Textbox(
+                                    label="Negative Prompt (what to avoid)",
+                                    value="blurry, low quality, bad anatomy, extra limbs, deformed, ugly, watermark, text, censored, merged bodies, fused limbs, conjoined, overlapping bodies, worst quality",
+                                    lines=2,
+                                )
 
-                        model_select = gr.Radio(
-                            choices=["FLUX (Best Faces)", "Pony Realism (People/Explicit)", "Juggernaut (Nature/Action)"],
-                            value="FLUX (Best Faces)",
-                            label="Select Model"
-                        )
+                                model_select = gr.Radio(
+                                    choices=["FLUX (Best Faces)", "Pony Realism (People/Explicit)", "Juggernaut (Nature/Action)"],
+                                    value="FLUX (Best Faces)",
+                                    label="Select Model"
+                                )
 
-                        use_trigger = gr.Checkbox(
-                            label=f"Add trigger word: '{CONFIG['trigger_word']}'",
-                            value=False,
-                        )
+                                use_trigger = gr.Checkbox(
+                                    label=f"Add trigger word: '{CONFIG['trigger_word']}'",
+                                    value=False,
+                                )
+
+                                with gr.Row():
+                                    img_width = gr.Slider(512, 1536, value=768, step=64, label="Width")
+                                    img_height = gr.Slider(512, 1536, value=1024, step=64, label="Height")
+
+                                with gr.Row():
+                                    img_steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
+                                    img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                                    img_guidance = gr.Slider(1, 12, value=3.5, step=0.5, label="Guidance (FLUX: 3-4, SDXL: 7-8)")
+
+                                generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
+
+                                with gr.Row():
+                                    unload_img_btn = gr.Button("🗑️ Unload Image Models", variant="secondary")
+                                    load_img_btn = gr.Button("📥 Load Image Models", variant="secondary")
+
+                                img_status = gr.Textbox(label="Model Status", value="Models ready", interactive=False)
+
+                                # Preset prompts
+                                gr.HTML("<h4 style='color: white; margin-top: 20px;'>Quick Presets:</h4>")
+
+                                preset_btns = []
+                                presets = [
+                                    ("Professional Portrait", "professional portrait, business attire, office background, confident pose"),
+                                    ("Casual Outdoor", "casual outfit, outdoor park setting, natural lighting, relaxed smile"),
+                                    ("Elegant Evening", "elegant black dress, evening setting, sophisticated pose"),
+                                    ("Athletic", "athletic wear, gym setting, energetic pose"),
+                                    ("Cozy Home", "cozy sweater, living room, warm lighting, relaxed"),
+                                ]
+
+                                for name, prompt in presets:
+                                    btn = gr.Button(name, size="sm")
+                                    btn.click(lambda p=prompt: p, outputs=img_prompt)
+
+                            with gr.Column(scale=1):
+                                output_image = gr.Image(label="Generated Image", height=512)
+                                output_info = gr.Textbox(label="Info", interactive=False)
+
+                    # ===== IMAGE TO IMAGE SUB-TAB =====
+                    with gr.TabItem("🖼️ Image to Image"):
+                        gr.HTML("""
+                        <div style="padding: 10px; background: rgba(100,200,100,0.1); border-radius: 8px; margin-bottom: 15px;">
+                            <p style="color: #aaffaa; margin: 0;"><b>💡 Workflow:</b> Generate face with FLUX → Upload here → Transform with Pony/Juggernaut</p>
+                        </div>
+                        """)
 
                         with gr.Row():
-                            img_width = gr.Slider(512, 1536, value=768, step=64, label="Width")
-                            img_height = gr.Slider(512, 1536, value=1024, step=64, label="Height")
+                            with gr.Column(scale=1):
+                                img2img_input = gr.Image(label="Upload Image (from FLUX or any source)", type="pil", height=300)
 
-                        with gr.Row():
-                            img_steps = gr.Slider(10, 50, value=25, step=1, label="Steps")
-                            img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
-                            img_guidance = gr.Slider(1, 12, value=3.5, step=0.5, label="Guidance (FLUX: 3-4, SDXL: 7-8)")
+                                img2img_prompt = gr.Textbox(
+                                    label="Prompt (describe modifications)",
+                                    placeholder="sexy lingerie, bedroom setting, seductive pose...",
+                                    lines=3,
+                                )
 
-                        generate_btn = gr.Button("🎨 Generate Image", variant="primary", size="lg")
+                                img2img_negative = gr.Textbox(
+                                    label="Negative Prompt",
+                                    value="blurry, bad anatomy, deformed, ugly, watermark",
+                                    lines=2,
+                                )
 
-                        with gr.Row():
-                            unload_img_btn = gr.Button("🗑️ Unload Image Models", variant="secondary")
-                            load_img_btn = gr.Button("📥 Load Image Models", variant="secondary")
+                                img2img_model = gr.Radio(
+                                    choices=["Pony Realism (Explicit)", "Juggernaut (Nature/Action)"],
+                                    value="Pony Realism (Explicit)",
+                                    label="Select Model"
+                                )
 
-                        img_status = gr.Textbox(label="Model Status", value="Models ready", interactive=False)
+                                img2img_strength = gr.Slider(0.1, 1.0, value=0.5, step=0.05,
+                                    label="Strength (0.3=keep face, 0.5=balanced, 0.8=major changes)")
 
-                        # Preset prompts
-                        gr.HTML("<h4 style='color: white; margin-top: 20px;'>Quick Presets:</h4>")
+                                with gr.Row():
+                                    img2img_steps = gr.Slider(10, 50, value=30, step=1, label="Steps")
+                                    img2img_guidance = gr.Slider(1, 12, value=7.0, step=0.5, label="Guidance")
+                                    img2img_seed = gr.Number(value=-1, label="Seed (-1 = random)")
 
-                        preset_btns = []
-                        presets = [
-                            ("Professional Portrait", "professional portrait, business attire, office background, confident pose"),
-                            ("Casual Outdoor", "casual outfit, outdoor park setting, natural lighting, relaxed smile"),
-                            ("Elegant Evening", "elegant black dress, evening setting, sophisticated pose"),
-                            ("Athletic", "athletic wear, gym setting, energetic pose"),
-                            ("Cozy Home", "cozy sweater, living room, warm lighting, relaxed"),
-                        ]
+                                img2img_btn = gr.Button("🔄 Transform Image", variant="primary", size="lg")
 
-                        for name, prompt in presets:
-                            btn = gr.Button(name, size="sm")
-                            btn.click(lambda p=prompt: p, outputs=img_prompt)
+                            with gr.Column(scale=1):
+                                img2img_output = gr.Image(label="Transformed Image", height=512)
+                                img2img_info = gr.Textbox(label="Info", interactive=False)
 
-                    with gr.Column(scale=1):
-                        output_image = gr.Image(label="Generated Image", height=512)
-                        output_info = gr.Textbox(label="Info", interactive=False)
+                        gr.HTML("""
+                        <div style="margin-top: 15px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 8px;">
+                            <h4 style="color: white; margin: 0 0 10px 0;">💡 Strength Guide:</h4>
+                            <ul style="color: #aaa; margin: 0; padding-left: 20px;">
+                                <li><b>0.3-0.4:</b> Keep face, change lighting/style</li>
+                                <li><b>0.5-0.6:</b> Modify outfit/pose while keeping likeness</li>
+                                <li><b>0.7-0.8:</b> Major changes, face may drift</li>
+                            </ul>
+                        </div>
+                        """)
 
-                # Gallery of recent generations
+                # Gallery of recent generations (outside sub-tabs)
                 gr.HTML("<h4 style='color: white; margin-top: 20px;'>Recent Generations:</h4>")
                 gallery = gr.Gallery(label="Gallery", columns=4, height=200)
 
@@ -5960,6 +6149,13 @@ def create_dashboard():
             outputs=[img_status]
         )
 
+        # Image to Image handler
+        img2img_btn.click(
+            generate_img2img,
+            inputs=[img2img_input, img2img_prompt, img2img_negative, img2img_model, img2img_strength, img2img_steps, img2img_guidance, img2img_seed],
+            outputs=[img2img_output, img2img_info]
+        )
+
         # Capture from server camera handler
         capture_server_btn.click(
             capture_from_server_camera,
@@ -6311,12 +6507,24 @@ def create_dashboard():
                     pass
 
                 try:
+                    # Find latest checkpoint
+                    ckpt_dir = "/workspace/host/ai-clone-training/my-output/alexandra-qwen72b-lora"
+                    latest_ckpt = None
+                    if os.path.exists(ckpt_dir):
+                        ckpts = [d for d in os.listdir(ckpt_dir) if d.startswith("checkpoint-")]
+                        if ckpts:
+                            latest_ckpt = os.path.join(ckpt_dir, max(ckpts, key=lambda x: int(x.split('-')[1])))
+
+                    cmd = ["python3", "/workspace/host/ai-clone-training/train_domain.py", "coding"]
+                    if latest_ckpt:
+                        cmd.extend(["--resume", latest_ckpt])
+
                     proc = subprocess.Popen(
-                        ["python3", "/workspace/train_ultimate_fast.py"],
+                        cmd,
                         stdout=open("/tmp/training_output.log", "w"),
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
-                        cwd="/workspace"
+                        cwd="/workspace/host/ai-clone-training"
                     )
                     training_process["pid"] = proc.pid
                     training_process["running"] = True
@@ -6333,7 +6541,7 @@ def create_dashboard():
 
             try:
                 # Kill both types of training processes
-                subprocess.run(["pkill", "-f", "train_ultimate_fast.py"], capture_output=True, text=True, timeout=10)
+                subprocess.run(["pkill", "-f", "train_domain.py"], capture_output=True, text=True, timeout=10)
                 subprocess.run(["pkill", "-f", "train_voice.py"], capture_output=True, text=True, timeout=10)
 
                 train_type = training_process.get("type", "unknown")
@@ -6366,7 +6574,7 @@ def create_dashboard():
             try:
                 # Check for LoRA training
                 result = subprocess.run(
-                    ["pgrep", "-f", "train_ultimate_fast.py"],
+                    ["pgrep", "-f", "train_domain.py"],
                     capture_output=True, text=True, timeout=5
                 )
                 if result.stdout.strip():
@@ -6487,7 +6695,7 @@ def create_dashboard():
 
             # First check if anything is currently running
             try:
-                lora_running = subprocess.run(["pgrep", "-f", "train_ultimate_fast.py"],
+                lora_running = subprocess.run(["pgrep", "-f", "train_domain.py"],
                     capture_output=True, text=True, timeout=5).stdout.strip()
                 voice_running = subprocess.run(["pgrep", "-f", "train_voice.py"],
                     capture_output=True, text=True, timeout=5).stdout.strip()
@@ -6766,6 +6974,11 @@ def main():
     use_share = os.environ.get('JARVIS_SHARE', 'true').lower() == 'true'
     print(f"[JARVIS] Starting with share={use_share}")
 
+    # Enable queue for concurrent request handling (prevents UI hang during long TTS)
+    dashboard.queue(
+        max_size=20,
+        default_concurrency_limit=2
+    )
     dashboard.launch(
         server_name="0.0.0.0",
         server_port=port,
