@@ -4296,12 +4296,26 @@ def create_dashboard():
 
             // Track source changes (for Gradio audio component reuse)
             let lastSrc = audio.src;
+            let audioBuffered = false;
+
             audio.addEventListener('loadstart', () => {
                 if (audio.src !== lastSrc) {
-                    console.log('[ORB] New audio source loaded');
+                    console.log('[ORB] New audio source loaded - waiting for buffer');
                     lastSrc = audio.src;
                     window.audioFinishTriggered = false;
                     window.audioPlaying = false;
+                    audioBuffered = false;
+                    // Pause immediately to prevent robotic playback while buffering
+                    audio.pause();
+                }
+            });
+
+            // Wait for audio to buffer fully before playing
+            audio.addEventListener('canplaythrough', () => {
+                if (!audioBuffered && audio.src) {
+                    audioBuffered = true;
+                    console.log('[ORB] Audio buffered - starting playback');
+                    audio.play().catch(e => console.log('[ORB] Play error:', e));
                 }
             });
 

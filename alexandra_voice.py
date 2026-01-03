@@ -222,13 +222,9 @@ def generate_voice(text, output_path=None, pitch_shift=None, voice=None):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Generate to temp file if pitch shifting
-    if pitch_shift != 1.0:
-        temp_output = os.path.join(output_dir, "temp_voice.wav")
-        output_file = "temp_voice.wav"
-    else:
-        temp_output = output_path
-        output_file = os.path.basename(output_path)
+    # Always generate to temp file first (for resampling to 44100 Hz)
+    temp_output = os.path.join(output_dir, "temp_voice_raw.wav")
+    output_file = "temp_voice_raw.wav"
 
     # Get speed from voice config or default
     speed = str(voice_config.get("speed", 1.0))
@@ -292,29 +288,38 @@ def generate_voice(text, output_path=None, pitch_shift=None, voice=None):
         return None
 
     print(f"[VOICE] File created: {temp_output}")
-    
-    # Apply pitch shifting for feminization
+
+    # Convert to MP3 at 44100 Hz for better browser compatibility
+    # MP3 handles streaming/buffering better than WAV
+    mp3_output = output_path.replace('.wav', '.mp3') if output_path.endswith('.wav') else output_path + '.mp3'
+
     if pitch_shift != 1.0:
         tempo_compensation = 1.0 / pitch_shift
-        pitch_cmd = [
+        convert_cmd = [
             "ffmpeg", "-y", "-i", temp_output,
             "-af", f"asetrate=44100*{pitch_shift},atempo={tempo_compensation},aresample=44100",
-            "-ar", "44100",
-            output_path
+            "-ar", "44100", "-b:a", "192k",
+            mp3_output
         ]
-        try:
-            pitch_result = subprocess.run(pitch_cmd, capture_output=True, text=True, timeout=60)
-            if pitch_result.returncode != 0:
-                print(f"[VOICE] Pitch shift failed, using original")
-                os.rename(temp_output, output_path)
-            else:
-                print(f"[VOICE] Pitch shift applied: {pitch_shift}x")
-                os.remove(temp_output)
-        except Exception as e:
-            print(f"[VOICE] Pitch shift error: {e}")
-            os.rename(temp_output, output_path)
-    
-    return output_path if os.path.exists(output_path) else None
+    else:
+        convert_cmd = [
+            "ffmpeg", "-y", "-i", temp_output,
+            "-ar", "44100", "-b:a", "192k",
+            mp3_output
+        ]
+
+    try:
+        convert_result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=60)
+        os.remove(temp_output)  # Clean up temp file
+        if convert_result.returncode != 0:
+            print(f"[VOICE] MP3 convert failed: {convert_result.stderr[:200]}")
+            return None
+        else:
+            print(f"[VOICE] Converted to MP3 44100Hz" + (f" + pitch {pitch_shift}x" if pitch_shift != 1.0 else ""))
+            return mp3_output
+    except Exception as e:
+        print(f"[VOICE] Convert error: {e}")
+        return None
 
 
 def get_voice_status():
@@ -336,12 +341,17 @@ def warmup_voice():
     if not F5_TTS_AVAILABLE:
         return "Voice not available"
 
-    # Set to jarvis voice (British male via p254 Surrey reference) before warmup
-    set_voice("jarvis")
+    # Warm up with jenny_british voice (used by default)
+    set_voice("jenny_british")
 
-    print("[VOICE] Warming up TTS model with JARVIS voice...")
-    # Generate a short phrase to warm up the model with the actual JARVIS voice
-    result = generate_voice("Hello, I am ready to assist you.", output_path="/tmp/warmup_voice.wav", voice="jarvis")
+    print("[VOICE] Warming up TTS model (pass 1)...")
+    # First generation is always robotic - discard it
+    generate_voice("Hello there.", output_path="/tmp/warmup_voice1.wav", voice="jenny_british")
+
+    print("[VOICE] Warming up TTS model (pass 2)...")
+    # Second generation should be good - this primes the model
+    result = generate_voice("I am ready to assist you.", output_path="/tmp/warmup_voice2.wav", voice="jenny_british")
+
     if result:
         _warmup_done = True
         print("[VOICE] Warmup complete!")
