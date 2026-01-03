@@ -336,12 +336,12 @@ def warmup_voice():
     if not F5_TTS_AVAILABLE:
         return "Voice not available"
 
-    # Set to jenny_british (the voice used by JARVIS) before warmup
-    set_voice("jenny_british")
+    # Set to jarvis voice (British male via p254 Surrey reference) before warmup
+    set_voice("jarvis")
 
-    print("[VOICE] Warming up TTS model with jenny_british voice...")
-    # Generate a short phrase to warm up the model
-    result = generate_voice("Hello, I am ready to assist you.", output_path="/tmp/warmup_voice.wav", voice="jenny_british")
+    print("[VOICE] Warming up TTS model with JARVIS voice...")
+    # Generate a short phrase to warm up the model with the actual JARVIS voice
+    result = generate_voice("Hello, I am ready to assist you.", output_path="/tmp/warmup_voice.wav", voice="jarvis")
     if result:
         _warmup_done = True
         print("[VOICE] Warmup complete!")
