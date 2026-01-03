@@ -3733,7 +3733,58 @@ def create_dashboard():
         let lastProcessedTime = 0;
         let pendingCommand = '';
 
+        // NOISE GATE - DISABLED for now to debug
+        let currentAudioLevel = 1;  // Always pass
+        const NOISE_GATE_THRESHOLD = 0.0;  // Disabled - let all audio through
+
+        // Set up audio level monitoring
+        async function setupNoiseGate() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(stream);
+                const analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256;
+                source.connect(analyser);
+
+                const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+                function checkLevel() {
+                    analyser.getByteFrequencyData(dataArray);
+                    let sum = 0;
+                    for (let i = 0; i < dataArray.length; i++) {
+                        sum += dataArray[i];
+                    }
+                    currentAudioLevel = sum / (dataArray.length * 255);  // 0-1 range
+                    requestAnimationFrame(checkLevel);
+                }
+                checkLevel();
+                console.log('[NOISE-GATE] Audio level monitoring active - threshold:', NOISE_GATE_THRESHOLD);
+            } catch (e) {
+                console.log('[NOISE-GATE] Could not set up audio monitoring:', e);
+                currentAudioLevel = 1;  // Disable gate if we can't monitor
+            }
+        }
+        setupNoiseGate();
+
         recognition.onresult = function(event) {
+            // ECHO CANCELLATION - ignore speech while JARVIS is talking
+            if (window.jarvisIsSpeaking) {
+                // Only allow stop commands while JARVIS is speaking
+                let text = '';
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    text = event.results[i][0].transcript.toLowerCase();
+                }
+                if (text.includes('stop') || text.includes('quiet') || text.includes('shut up')) {
+                    if (window.stopAllAudio) window.stopAllAudio();
+                }
+                return;  // Ignore everything else - it's JARVIS's own voice
+            }
+
+            // NOISE GATE CHECK - ignore if audio level is too low (background noise)
+            if (currentAudioLevel < NOISE_GATE_THRESHOLD) {
+                return;  // Silently ignore background noise
+            }
             // Check for stop commands first (always works)
             let quickCheck = '';
             for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -3821,6 +3872,11 @@ def create_dashboard():
                             console.log('[JARVIS] Conversation timeout');
                         }, 120000);
 
+                        // MUTE MIC IMMEDIATELY - prevent echo before response arrives
+                        window.jarvisIsSpeaking = true;
+                        window.lastCommandSentTime = Date.now();  // Track when command was sent
+                        console.log('[ECHO] Mic muted - waiting for JARVIS response');
+
                         // Send the command
                         const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
                         nativeInputValueSetter.call(input, command);
@@ -3834,6 +3890,10 @@ def create_dashboard():
                         // Don't pause wake word - it handles stop commands
                     }
                 } else if (!isFinal && hasWakeWord) {
+                    // Track the longest transcript with wake word
+                    if (!window.pendingWakeCommand || transcript.length > window.pendingWakeCommand.length) {
+                        window.pendingWakeCommand = transcript;
+                    }
                     console.log('👂 Listening...', transcript);
                 }
             }
@@ -3843,6 +3903,37 @@ def create_dashboard():
         window.wakeWordRecognition = recognition;
 
         recognition.onend = () => {
+            // FALLBACK: If Chrome never sent isFinal, process the pending command
+            if (window.pendingWakeCommand && !window.conversationMode) {
+                const transcript = window.pendingWakeCommand;
+                window.pendingWakeCommand = null;
+
+                let command = transcript.replace(/.*?(hey )?(jarvis|j\.a\.r\.v\.i\.s|jarves|jervis)[,.]?\s*/i, '').trim();
+                if (command && command.length > 2) {
+                    console.log('🎤 Processing on recognition end:', command);
+                    window.jarvisIsSpeaking = true;  // Mute for echo
+                    window.lastCommandSentTime = Date.now();  // Track when command was sent
+
+                    const input = document.querySelector('textarea[placeholder*="Ask me anything"]');
+                    const buttons = document.querySelectorAll('button');
+                    let sendBtn = null;
+                    for (let b of buttons) {
+                        if (b.textContent.includes('Send')) { sendBtn = b; break; }
+                    }
+                    if (input && sendBtn) {
+                        window.conversationMode = true;
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(input, command);
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        setTimeout(() => {
+                            sendBtn.click();
+                            console.log('✅ Sent:', command);
+                        }, 150);
+                        return;  // Don't restart recognition yet
+                    }
+                }
+            }
+
             // Only auto-restart if NOT in conversation mode
             if (!window.conversationMode) {
                 setTimeout(() => recognition.start(), 50);
@@ -3914,9 +4005,9 @@ def create_dashboard():
                     return;
                 }
 
-                // If audio is playing, ignore everything else (avoid echo)
-                if (window.audioPlayingMode) {
-                    console.log('[JARVIS] Audio playing - ignoring non-stop words');
+                // If audio is playing OR mic is muted, ignore everything (avoid echo)
+                if (window.audioPlayingMode || window.jarvisIsSpeaking) {
+                    console.log('[JARVIS] Mic muted - ignoring (echo prevention)');
                     return;
                 }
 
@@ -3925,12 +4016,16 @@ def create_dashboard():
                 window.lastConvResult = true; // Mark that we got a result
 
                 // Check for exit phrases - stop conversation mode and wait for wake word
-                const exitPhrases = ['goodbye', 'good bye', 'stop listening', 'stop conversation',
+                const exitPhrases = ['goodbye', 'good bye', 'bye jarvis', 'bye bye',
+                    'stop', 'stop listening', 'stop conversation', 'stop jarvis',
                     'that\\'s all', 'thats all', 'that is all', 'never mind', 'nevermind',
-                    'go to sleep', 'sleep mode', 'standby', 'stand by', 'dismiss', 'dismissed'];
+                    'go to sleep', 'sleep mode', 'standby', 'stand by', 'dismiss', 'dismissed',
+                    'shut up', 'be quiet', 'quiet'];
                 const lowerText = transcript.toLowerCase();
                 if (exitPhrases.some(p => lowerText.includes(p))) {
                     window.conversationMode = false;
+                    window.jarvisIsSpeaking = false;  // UNMUTE MIC
+                    window.speakingStartTime = 0;
                     if (window.setOrbState) window.setOrbState(null);
                     const indicator = document.getElementById('conv-mode-indicator');
                     if (indicator) indicator.style.display = 'none';
@@ -3952,28 +4047,39 @@ def create_dashboard():
                             console.log('[JARVIS] Wake word recognition resumed - standing by');
                         } catch(e) {}
                     }
-                    console.log('[JARVIS] Conversation ended - awaiting wake word');
+                    console.log('[JARVIS] Conversation ended - mic active - awaiting wake word');
                     return;
                 }
 
-                // Reset conversation timeout
+                // Reset conversation timeout (2 minutes of no input)
                 if (window.conversationTimeout) clearTimeout(window.conversationTimeout);
                 window.conversationTimeout = setTimeout(() => {
                     window.conversationMode = false;
+                    window.jarvisIsSpeaking = false;  // UNMUTE MIC
+                    window.speakingStartTime = 0;
                     const indicator = document.getElementById('conv-mode-indicator');
                     if (indicator) indicator.style.display = 'none';
                     if (window.wakeWordRecognition) {
                         try { window.wakeWordRecognition.start(); } catch(e) {}
                     }
-                    console.log('[JARVIS] Conversation mode timeout');
+                    console.log('[JARVIS] Conversation mode timeout - mic active');
                 }, 120000);
 
                 // Filter out JARVIS response phrases (in case we pick up our own voice)
-                const jarvisPhrases = ["maam", "ms alexandra", "weather forecast",
-                    "temperature", "degrees fahrenheit", "ridgway", "indeed"];
+                const jarvisPhrases = [
+                    "maam", "ma'am", "ms alexandra", "miss alexandra", "alexandra",
+                    "indeed", "pleasure", "trust this", "meets with your approval",
+                    "familiar territory", "revisit", "informed me", "previously",
+                    "vital information", "revolving door", "delightful",
+                    "weather forecast", "temperature", "degrees fahrenheit", "ridgway",
+                    "at your service", "shall i", "might i suggest", "if i may",
+                    "certainly", "of course", "as you wish", "right away",
+                    "one might question", "your aunt", "your uncle"
+                ];
                 const lowerTranscript = transcript.toLowerCase();
                 const matchCount = jarvisPhrases.filter(p => lowerTranscript.includes(p)).length;
-                if (matchCount >= 2) {
+                // More aggressive echo filtering - just 1 match is enough
+                if (matchCount >= 1) {
                     console.log("[JARVIS] Ignoring echo:", matchCount, "matches");
                     return;
                 }
@@ -3990,6 +4096,11 @@ def create_dashboard():
                 }
 
                 if (input && sendBtn && transcript.length > 1) {
+                    // MUTE MIC IMMEDIATELY - prevent echo
+                    window.jarvisIsSpeaking = true;
+                    window.lastCommandSentTime = Date.now();  // Track when command was sent
+                    console.log('[ECHO] Mic muted - sending command');
+
                     // Reset audio detection state for next response
                     window.audioFinishTriggered = false;
                     window.audioPlaying = false;
@@ -4039,22 +4150,33 @@ def create_dashboard():
         // Audio monitor - manage recognition around audio playback
         window.audioPlaying = false;
         window.lastRecognitionEnd = 0;  // Cooldown timestamp
+        window.speakingStartTime = 0;  // Track when speaking started for timeout
 
         setInterval(() => {
-            // Check if any audio is playing
+            // Check if any audio is playing (check multiple selectors)
             let nowPlaying = false;
-            document.querySelectorAll('audio').forEach(a => {
-                if (!a.paused && a.currentTime > 0 && a.duration > 0) {
-                    nowPlaying = true;
+            const audioElements = document.querySelectorAll('audio, video, [class*="audio"]');
+            audioElements.forEach(a => {
+                if (a.tagName === 'AUDIO' || a.tagName === 'VIDEO') {
+                    if (!a.paused && a.currentTime > 0) {
+                        nowPlaying = true;
+                    }
                 }
+            });
+
+            // Also check Gradio audio components
+            const gradioAudio = document.querySelectorAll('.audio-player audio, gradio-audio audio');
+            gradioAudio.forEach(a => {
+                if (!a.paused) nowPlaying = true;
             });
 
             // Audio STARTED playing - keep recognition running for interrupt
             if (nowPlaying && !window.audioPlaying) {
                 window.audioPlaying = true;
+                window.jarvisIsSpeaking = true;  // ECHO CANCELLATION - ignore mic input
                 window.audioPlayingMode = true;  // Flag to enable interrupt detection
-                console.log('[AUDIO] Playing - listening for interrupt words (stop, quiet, enough)');
-                // DON'T stop recognition - keep it running to detect stop words
+                window.speakingStartTime = Date.now();  // Track start time
+                console.log('[AUDIO] JARVIS speaking - mic muted (except stop commands)');
             }
 
             // Audio STOPPED playing
@@ -4062,7 +4184,32 @@ def create_dashboard():
                 window.audioPlaying = false;
                 window.audioPlayingMode = false;
                 window.lastRecognitionEnd = Date.now();  // Set cooldown
-                console.log('[AUDIO] Stopped');
+                window.speakingStartTime = 0;
+                // Wait a moment before re-enabling mic (audio echo delay)
+                setTimeout(() => {
+                    window.jarvisIsSpeaking = false;
+                    console.log('[AUDIO] JARVIS done speaking - mic active');
+                }, 500);
+            }
+
+            // TIMEOUT FALLBACK: If jarvisIsSpeaking has been true for 30+ seconds, force unmute
+            if (window.jarvisIsSpeaking && window.speakingStartTime > 0) {
+                const speakingDuration = Date.now() - window.speakingStartTime;
+                if (speakingDuration > 30000) {
+                    console.log('[AUDIO] Timeout - forcing mic unmute after 30s');
+                    window.jarvisIsSpeaking = false;
+                    window.audioPlaying = false;
+                    window.audioPlayingMode = false;
+                    window.speakingStartTime = 0;
+                }
+            }
+
+            // SAFETY: If jarvisIsSpeaking is stuck without a start time, clear it
+            // BUT only if it's been more than 15 seconds since last command was sent
+            const timeSinceCommand = Date.now() - (window.lastCommandSentTime || 0);
+            if (window.jarvisIsSpeaking && !window.speakingStartTime && !nowPlaying && timeSinceCommand > 15000) {
+                console.log('[AUDIO] Safety clear - jarvisIsSpeaking was stuck (15s+ since command)');
+                window.jarvisIsSpeaking = false;
             }
 
             // Watchdog: only restart if cooldown passed (3 seconds since last end)
@@ -4072,7 +4219,7 @@ def create_dashboard():
                 window.lastRecognitionEnd = Date.now();  // Reset cooldown
                 window.startListening();
             }
-        }, 500);  // Check every 500ms instead of 200ms
+        }, 500);  // Check every 500ms
     }
     initWakeWord();
 
@@ -4258,22 +4405,6 @@ def create_dashboard():
     setTimeout(autoStartCamera, 3000);
 
     // Audio device diagnostic function
-    // Override getUserMedia to use selected device
-    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-    navigator.mediaDevices.getUserMedia = async function(constraints) {
-        // Check if Gradio audio selector has a selection
-        const gradioSelect = document.querySelector('select[data-testid="audio-source-select"]');
-        if (gradioSelect && gradioSelect.value && constraints.audio) {
-            console.log("[JARVIS] Forcing audio device:", gradioSelect.value);
-            if (typeof constraints.audio === "boolean") {
-                constraints.audio = { deviceId: { exact: gradioSelect.value } };
-            } else {
-                constraints.audio.deviceId = { exact: gradioSelect.value };
-            }
-        }
-        return originalGetUserMedia(constraints);
-    };
-    console.log("[JARVIS] Audio device override installed");
 
 
     window.showAudioDevices = async function() {
@@ -5698,9 +5829,9 @@ def create_dashboard():
                             refresh_models_btn = gr.Button("🔄 Refresh Models", variant="secondary")
                             test_ollama_btn = gr.Button("🔄 Test Connection", variant="secondary")
 
-                        # Local model selector (if available) - hidden if no models
+                        # Local model selector (if available)
                         if LOCAL_MODEL_AVAILABLE:
-                            gr.HTML("<hr><h4 style='color: #888;'>Local HuggingFace Models (Optional)</h4>")
+                            gr.HTML("<hr><h4 style='color: #00d4ff;'>🧠 Local Models (Qwen 72B)</h4>")
                             model_selector = gr.Radio(
                                 label="Local Model (click to select)",
                                 choices=list(AVAILABLE_MODELS.keys()),
@@ -7043,7 +7174,7 @@ def main():
     """)
 
     # Auto-load the Vision-Language model on startup
-    if LOCAL_MODEL_AVAILABLE:
+    if False and LOCAL_MODEL_AVAILABLE:  # DISABLED
         print("[JARVIS] Auto-loading Qwen2.5-VL-72B vision model...")
         try:
             # Prefer VL model for vision+chat, fall back to first available
