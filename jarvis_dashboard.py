@@ -1296,6 +1296,15 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
         'wife', 'husband', 'friend', 'boss', 'pet', 'dog', 'cat', 'car'
     ])
 
+    # Math/calculation questions - don't web search, let LLM calculate
+    import re as _re
+    is_math_question = bool(_re.search(r'[\d\+\-\*\/\^\√\×\÷\=]', message)) or any(kw in msg_lower for kw in [
+        'square root', 'sqrt', 'calculate', 'compute', 'solve', 'equation',
+        'plus', 'minus', 'times', 'divided by', 'multiply', 'divide',
+        'sum of', 'product of', 'factorial', 'percent', 'percentage',
+        'power of', 'squared', 'cubed', 'to the power'
+    ])
+
     is_tool_query = any(kw in msg_lower for kw in tool_keywords) and not is_personal_question
     is_snapshot_request = any(kw in msg_lower for kw in snapshot_keywords)
     is_jarvis_command = any(kw in msg_lower for kw in jarvis_keywords)
@@ -1671,7 +1680,8 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
 
     # is_personal_question already defined above - use it to skip web search
     # Also skip if it's just a short confirmation - don't search for "yes please" literally
-    needs_web_search = (any(kw in msg_lower for kw in web_search_keywords) or is_info_question or is_followup) and not is_personal_question and not is_just_confirmation
+    # Skip math questions - let LLM calculate directly
+    needs_web_search = (any(kw in msg_lower for kw in web_search_keywords) or is_info_question or is_followup) and not is_personal_question and not is_just_confirmation and not is_math_question
 
     # Log for debugging
     logger.info(f"[SEARCH TRIGGER] followup={is_followup}, confirmation={is_just_confirmation}, needs_search={needs_web_search}")
@@ -1790,9 +1800,14 @@ async def chat_with_jarvis(message: str, history: list) -> tuple:
                                 'ravens', 'browns', 'bengals', 'chiefs', 'bills', 'dolphins', 'jets',
                                 'giants', 'commanders', 'bears', 'lions', 'packers', 'vikings']
             is_sports_query = any(team in search_query for team in sports_team_names)
-            if is_sports_query and 'playing' in search_query:
+            if is_sports_query and ('playing' in search_query or 'game' in search_query or 'time' in search_query):
                 # Add "NFL schedule" for football teams to get better results
-                search_query = f"{search_query} NFL schedule 2024"
+                # Use current year for accurate results
+                from datetime import datetime as _dt
+                current_year = _dt.now().year
+                # NFL season spans two years - use the season start year
+                nfl_season_year = current_year if _dt.now().month >= 8 else current_year - 1
+                search_query = f"{search_query} NFL schedule {nfl_season_year}"
 
             logger.info(f"[WEB SEARCH] Searching for: {search_query}")
 
@@ -4296,26 +4311,12 @@ def create_dashboard():
 
             // Track source changes (for Gradio audio component reuse)
             let lastSrc = audio.src;
-            let audioBuffered = false;
-
             audio.addEventListener('loadstart', () => {
                 if (audio.src !== lastSrc) {
-                    console.log('[ORB] New audio source loaded - waiting for buffer');
+                    console.log('[ORB] New audio source loaded');
                     lastSrc = audio.src;
                     window.audioFinishTriggered = false;
                     window.audioPlaying = false;
-                    audioBuffered = false;
-                    // Pause immediately to prevent robotic playback while buffering
-                    audio.pause();
-                }
-            });
-
-            // Wait for audio to buffer fully before playing
-            audio.addEventListener('canplaythrough', () => {
-                if (!audioBuffered && audio.src) {
-                    audioBuffered = true;
-                    console.log('[ORB] Audio buffered - starting playback');
-                    audio.play().catch(e => console.log('[ORB] Play error:', e));
                 }
             });
 
@@ -4826,7 +4827,7 @@ def create_dashboard():
                     with gr.Column(scale=1):
                         # Avatar video panel
                         avatar_video = gr.Video(
-                            value="/workspace/ai-clone-chat/avatar_idle.mp4",
+                            value="avatar_idle.mp4",
                             label="🎭 Avatar",
                             autoplay=True,
                             loop=False,

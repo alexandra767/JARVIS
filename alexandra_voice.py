@@ -302,8 +302,10 @@ def generate_voice(text, output_path=None, pitch_shift=None, voice=None):
             mp3_output
         ]
     else:
+        # Add 200ms silence at start to help browser AudioContext initialize
         convert_cmd = [
             "ffmpeg", "-y", "-i", temp_output,
+            "-af", "adelay=200|200,apad=pad_dur=0.1",
             "-ar", "44100", "-b:a", "192k",
             mp3_output
         ]
