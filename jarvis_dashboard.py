@@ -4,6 +4,15 @@ JARVIS Dashboard - Full Visual Interface
 Combines real-time widgets, voice interaction, camera, and image generation
 """
 
+# Fix PyTorch 2.6+ compatibility BEFORE any imports
+import torch
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+
 # Import local model loading
 try:
     from alexandra_model import load_model, unload_model, generate_response as model_generate, get_model_status, AVAILABLE_MODELS, DEFAULT_MODEL
@@ -14,11 +23,15 @@ except ImportError as e:
 
 # Import voice/TTS module
 try:
-    from alexandra_voice import generate_voice, get_voice_status, F5_TTS_AVAILABLE
+    from alexandra_voice import generate_voice, get_voice_status, F5_TTS_AVAILABLE, warmup_voice
     VOICE_TTS_AVAILABLE = F5_TTS_AVAILABLE
+    # Warmup voice on first use (lazy)
+    _voice_warmed_up = False
 except ImportError as e:
     print(f"Voice module not available: {e}")
     VOICE_TTS_AVAILABLE = False
+    warmup_voice = None
+    _voice_warmed_up = True
 
 # Import vision module (Qwen2-VL)
 try:
@@ -30,6 +43,19 @@ try:
 except ImportError as e:
     print(f"Qwen2-VL vision module not available: {e}")
     QWEN_VISION_READY = False
+
+# Import avatar module (MuseTalk)
+try:
+    from alexandra_avatar import (
+        get_engine as get_avatar_engine, list_avatar_outfits, prepare_avatar,
+        generate_avatar_video, load_avatar_models, unload_avatar_models,
+        get_avatar_status, MUSETALK_AVAILABLE
+    )
+    AVATAR_AVAILABLE = MUSETALK_AVAILABLE
+except ImportError as e:
+    print(f"Avatar module not available: {e}")
+    AVATAR_AVAILABLE = False
+    MUSETALK_AVAILABLE = False
 
 import gradio as gr
 import asyncio
@@ -4784,6 +4810,28 @@ def create_dashboard():
                 with gr.Row():
                     # Left column - Widgets
                     with gr.Column(scale=1):
+                        # Avatar video panel
+                        avatar_video = gr.Video(
+                            value="/workspace/ai-clone-chat/avatar_idle.mp4",
+                            label="🎭 Avatar",
+                            autoplay=True,
+                            loop=False,
+                            height=300,
+                            show_label=True,
+                            visible=True
+                        )
+                        with gr.Row():
+                            avatar_enabled = gr.Checkbox(label="🎭 Avatar", value=False, scale=1)
+                            avatar_load_btn = gr.Button("Load", size="sm", scale=1)
+                            avatar_unload_btn = gr.Button("Unload", size="sm", scale=1)
+                        # Hidden dropdown - always use custom
+                        avatar_outfit = gr.Dropdown(
+                            choices=["custom"],
+                            value="custom",
+                            visible=False
+                        )
+                        avatar_status = gr.Markdown(f"*{get_avatar_status() if AVATAR_AVAILABLE else 'Avatar not available'}*")
+
                         weather_html = gr.HTML(label="Weather")
                         gpu_html = gr.HTML(label="GPU Status", value=get_gpu_widget())
                         time_html = gr.HTML(label="Time")
@@ -4864,7 +4912,7 @@ def create_dashboard():
                                 interactive=True
                             )
                             cloud_voice_selector = gr.Radio(
-                                choices=["JARVIS", "Browser"],
+                                choices=["JARVIS", "Jenny", "Browser"],
                                 value="JARVIS",
                                 label="🎙️ Voice",
                                 scale=1,
@@ -5948,7 +5996,7 @@ def create_dashboard():
         # Chat handlers
         chat_state = gr.State([])
 
-        async def process_chat(message, history, use_tts=False, model_choice="Local", voice_choice="Local"):
+        async def process_chat(message, history, use_tts=False, model_choice="Local", voice_choice="Local", avatar_on=False, avatar_outfit_name=None):
             import sys
             global _use_gemini, _use_elevenlabs
             # Update cloud mode based on UI selection
@@ -6021,6 +6069,12 @@ def create_dashboard():
                                 tts_text = tts_text.rstrip() + " ..."
                             logger.info(f"[TTS] Truncated from {len(last_response)} to {len(tts_text)} chars")
                         logger.info(f"[TTS] Generating voice for: {tts_text[:50]}...")
+                        # Warmup voice on first use
+                        global _voice_warmed_up
+                        if not _voice_warmed_up and warmup_voice:
+                            logger.info("[TTS] Warming up voice model...")
+                            warmup_voice()
+                            _voice_warmed_up = True
                         # Browser JARVIS mode - skip server-side TTS, let JS handle it
                         if _use_browser_tts:
                             logger.info("[TTS] Browser JARVIS mode - frontend will speak")
@@ -6046,7 +6100,18 @@ def create_dashboard():
                     except Exception as e:
                         logger.error(f"[TTS] Error: {e}", exc_info=True)
 
-            return format_chat_history(new_history), new_history, "", audio_path, image_path, nav_visible, nav_map_html, nav_info, nav_url
+            # Generate avatar video if enabled and we have audio
+            avatar_video_path = None
+            if avatar_on and AVATAR_AVAILABLE and audio_path:
+                try:
+                    logger.info(f"[AVATAR] Generating video for outfit: {avatar_outfit_name}")
+                    avatar_video_path = generate_avatar_video(audio_path, avatar_outfit_name)
+                    if avatar_video_path:
+                        logger.info(f"[AVATAR] Video generated: {avatar_video_path}")
+                except Exception as e:
+                    logger.error(f"[AVATAR] Error generating video: {e}")
+
+            return format_chat_history(new_history), new_history, "", audio_path, image_path, nav_visible, nav_map_html, nav_info, nav_url, avatar_video_path
 
         # Cloud mode selection handlers
         def update_model_mode(model_choice):
@@ -6068,6 +6133,13 @@ def create_dashboard():
                 except:
                     pass
                 status = "Voice: JARVIS ✅"
+            elif voice_choice == "Jenny":
+                try:
+                    from alexandra_voice import set_voice
+                    set_voice("jenny_british")
+                except:
+                    pass
+                status = "Voice: Jenny ✅"
             elif _use_browser_tts:
                 status = "Voice: Browser ✅"
             else:
@@ -6091,14 +6163,14 @@ def create_dashboard():
 
         send_btn.click(
             process_chat,
-            inputs=[chat_input, chat_state, voice_enabled_chat, cloud_model_selector, cloud_voice_selector],
-            outputs=[chatbot, chat_state, chat_input, voice_audio_output, chat_image_output, directions_container, directions_map_display, directions_info, directions_map_url]
+            inputs=[chat_input, chat_state, voice_enabled_chat, cloud_model_selector, cloud_voice_selector, avatar_enabled, avatar_outfit],
+            outputs=[chatbot, chat_state, chat_input, voice_audio_output, chat_image_output, directions_container, directions_map_display, directions_info, directions_map_url, avatar_video]
         )
 
         chat_input.submit(
             process_chat,
-            inputs=[chat_input, chat_state, voice_enabled_chat, cloud_model_selector, cloud_voice_selector],
-            outputs=[chatbot, chat_state, chat_input, voice_audio_output, chat_image_output, directions_container, directions_map_display, directions_info, directions_map_url]
+            inputs=[chat_input, chat_state, voice_enabled_chat, cloud_model_selector, cloud_voice_selector, avatar_enabled, avatar_outfit],
+            outputs=[chatbot, chat_state, chat_input, voice_audio_output, chat_image_output, directions_container, directions_map_display, directions_info, directions_map_url, avatar_video]
         )
 
         # Directions widget handlers
@@ -6214,16 +6286,60 @@ def create_dashboard():
                 outputs=[model_status]
             )
 
+        # Avatar event handlers
+        if AVATAR_AVAILABLE:
+            def on_avatar_load(outfit_name):
+                try:
+                    result = load_avatar_models()
+                    # Also prepare the avatar after loading models
+                    if "loaded" in result.lower() or "already" in result.lower():
+                        prep_result = prepare_avatar(outfit_name)
+                        return f"*{result} - {prep_result}*"
+                    return f"*{result}*"
+                except Exception as e:
+                    return f"*Error: {e}*"
+
+            def on_avatar_unload():
+                try:
+                    result = unload_avatar_models()
+                    return f"*{result}*"
+                except Exception as e:
+                    return f"*Error: {e}*"
+
+            def on_avatar_outfit_change(outfit_name):
+                try:
+                    result = prepare_avatar(outfit_name)
+                    return f"*{result}*"
+                except Exception as e:
+                    return f"*Error: {e}*"
+
+            avatar_load_btn.click(
+                on_avatar_load,
+                inputs=[avatar_outfit],
+                outputs=[avatar_status]
+            )
+
+            avatar_unload_btn.click(
+                on_avatar_unload,
+                outputs=[avatar_status]
+            )
+
+            avatar_outfit.change(
+                on_avatar_outfit_change,
+                inputs=[avatar_outfit],
+                outputs=[avatar_status]
+            )
+
         # Voice transcription handler
         import whisper
         whisper_model = None
 
-        async def transcribe_and_chat(audio_path, history, use_tts):
+        async def transcribe_and_chat(audio_path, history, use_tts, avatar_on=False, avatar_outfit_name=None):
             nonlocal whisper_model
             print(f"[VOICE INPUT] Received audio_path: {audio_path}")
             if audio_path is None:
                 print("[VOICE INPUT] No audio received - audio_path is None")
-                return format_chat_history(history), history, "No audio recorded - please check microphone", None, None, None
+                return format_chat_history(history), history, "No audio recorded - please check microphone", None, None, None, None
 
             # Check if file exists and has content
             import os
@@ -6232,7 +6348,7 @@ def create_dashboard():
                 print(f"[VOICE INPUT] Audio file exists, size: {file_size} bytes")
                 if file_size < 1000:
                     print("[VOICE INPUT] Audio file too small - likely silent/empty recording")
-                    return format_chat_history(history), history, "Recording was empty - please speak into microphone", None, None, None
+                    return format_chat_history(history), history, "Recording was empty - please speak into microphone", None, None, None, None
             else:
                 print(f"[VOICE INPUT] Audio file does not exist: {audio_path}")
 
@@ -6271,7 +6387,7 @@ def create_dashboard():
                 print(f"[WHISPER] Transcribed: {text}")
 
                 if not text:
-                    return format_chat_history(history), history, "", None, None, None
+                    return format_chat_history(history), history, "", None, None, None, None
 
                 # Now chat with the transcribed text
                 new_history, _, image_path = await chat_with_jarvis(text, history)
@@ -6291,15 +6407,23 @@ def create_dashboard():
                         except Exception as e:
                             print(f"[TTS] Error: {e}")
 
-                return format_chat_history(new_history), new_history, text, audio_out, None, image_path
+                # Generate avatar video if enabled and we have audio
+                avatar_video_out = None
+                if avatar_on and AVATAR_AVAILABLE and audio_out:
+                    try:
+                        avatar_video_out = generate_avatar_video(audio_out, avatar_outfit_name)
+                    except Exception as e:
+                        print(f"[AVATAR] Error: {e}")
+
+                return format_chat_history(new_history), new_history, text, audio_out, None, image_path, avatar_video_out
             except Exception as e:
                 print(f"[WHISPER] Error: {e}")
-                return format_chat_history(history), history, f"Error: {e}", None, None, None
+                return format_chat_history(history), history, f"Error: {e}", None, None, None, None
 
         transcribe_btn.click(
             transcribe_and_chat,
-            inputs=[mic_input, chat_state, voice_enabled_chat],
-            outputs=[chatbot, chat_state, chat_input, voice_audio_output, mic_input, chat_image_output]
+            inputs=[mic_input, chat_state, voice_enabled_chat, avatar_enabled, avatar_outfit],
+            outputs=[chatbot, chat_state, chat_input, voice_audio_output, mic_input, chat_image_output, avatar_video]
         )
 
         # Widget refresh handlers
@@ -7195,6 +7319,12 @@ def main():
     # Use Gradio share for HTTPS (creates secure gradio.live URL)
     use_share = os.environ.get('JARVIS_SHARE', 'true').lower() == 'true'
     print(f"[JARVIS] Starting with share={use_share}")
+
+    # Warmup voice TTS at startup so first response sounds good
+    if VOICE_TTS_AVAILABLE and warmup_voice:
+        print("[JARVIS] Warming up voice TTS...")
+        warmup_voice()
+        print("[JARVIS] Voice warmup complete!")
 
     # Enable queue for concurrent request handling (prevents UI hang during long TTS)
     dashboard.queue(

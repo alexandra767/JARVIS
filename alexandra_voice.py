@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 
 # F5-TTS Configuration
-F5_TTS_DIR = os.path.expanduser("~/voice_training/F5-TTS")
+F5_TTS_DIR = "/workspace/host/voice_training/F5-TTS"
 # Use jenny_british model - well-trained, use p254 reference for male voice cloning
 F5_TTS_CHECKPOINT = os.path.join(F5_TTS_DIR, "ckpts/jenny_british/model_last.pt")
 
@@ -322,3 +322,28 @@ def get_voice_status():
     if F5_TTS_AVAILABLE:
         return "F5-TTS Ready"
     return "Voice not available"
+
+
+# Track if warmup has been done
+_warmup_done = False
+
+def warmup_voice():
+    """Run a quick warmup generation to pre-load models"""
+    global _warmup_done
+    if _warmup_done:
+        return "Already warmed up"
+
+    if not F5_TTS_AVAILABLE:
+        return "Voice not available"
+
+    # Set to jenny_british (the voice used by JARVIS) before warmup
+    set_voice("jenny_british")
+
+    print("[VOICE] Warming up TTS model with jenny_british voice...")
+    # Generate a short phrase to warm up the model
+    result = generate_voice("Hello, I am ready to assist you.", output_path="/tmp/warmup_voice.wav", voice="jenny_british")
+    if result:
+        _warmup_done = True
+        print("[VOICE] Warmup complete!")
+        return "Warmup complete"
+    return "Warmup failed"
